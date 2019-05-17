@@ -145,4 +145,25 @@ SELECT product_id, properties ->> '$.manufacturer.key_name' AS weight  -- this r
 FROM products
 WHERE product_id = 1;
 
+
+-- we can also update individual properties or set new properties in a JSON object
+-- we use the JSON Set function
+UPDATE products
+SET properties = JSON_SET(
+  properties,       -- specify the JSON object
+  '$.weight', 20,   -- we update this property
+  '$.age', 10       -- we set a new property
+)
+WHERE product_id = 1;
+
+
+-- we can also remove individual properties in a JSON object
+-- we use the JSON Remove function
+UPDATE products
+SET properties = JSON_REMOVE(
+  properties,   -- specify the JSON object
+  '$.age'       -- we remove this property
+)
+WHERE product_id = 1;
+
 ```
