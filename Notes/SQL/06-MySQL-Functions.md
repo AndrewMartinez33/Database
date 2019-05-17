@@ -122,6 +122,4 @@ SELECT
   -- you need the END keyword to close the CASE statement
   END AS category
 FROM orders
-
-
 ```
