@@ -1,6 +1,6 @@
 ```sql
 -- specify the database you are using
-USE sql_store
+USE sql_store;
 
 ```
 
