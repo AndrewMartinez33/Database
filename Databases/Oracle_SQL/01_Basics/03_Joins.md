@@ -240,30 +240,3 @@ FROM sizes_table
 CROSS JOIN colors_table;
 
 ```
-
-# UNIONS
-
-When we use JOINS we are combining columns from different table, but we can also combine rows from different table with UNION
-
-For example, lets say we have a table Orders and we want to return all the order with a status column. In status we want to label all orders in the current year as 'active' and all orders before the current year as 'inactive'.
-
-```sql
--- we can use UNION to combine the results of two queries on the same table
-SELECT
--- the first query determines the names of the columns
-  order_id,
-  order_date,
-  "Active" AS status
-FROM orders
-WHERE order_date >= "2019-01-01"
-UNION
-SELECT
-  order_id,
-  order_date,
-  "Archived" AS status
-FROM orders
-WHERE order_date < "2019-01-01";
-
-```
-
--
