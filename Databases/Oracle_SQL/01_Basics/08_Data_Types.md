@@ -7,9 +7,9 @@
 - VARCHAR2 – introduce you to the variable-length character and show you how to define variable-length character columns in a table.
 - NVARCHAR2 – learn how to store variable-length Unicode characters in the database.
 - DATE – discuss the date and time data type and show you how to handle date time data effectively.
+- TIMESTAMP WITH TIME ZONE – learn how to store datetime with timezone data.
 - TIMESTAMP – introduce you how to store date and time with the fractional seconds precision.
 - INTERVAL– focus on the interval data types to store periods of time.
-- TIMESTAMP WITH TIME ZONE – learn how to store datetime with timezone data.
 - LONG - variable length character data (up to 2gb)
 - CLOB - maximum size is (4gb - 1) \* (DB_BLOCK_SIZE)
 - RAW and LONG RAW - Raw binary data

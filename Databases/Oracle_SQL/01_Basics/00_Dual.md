@@ -40,5 +40,3 @@ FROM
 The DUAL table is most simple one because it was designed for fast access.
 
 In Oracle 10g release 1 and above, Oracle treats the use of DUAL the same as calling a function which simply evaluates the expression used in the select list. This optimization provides even a better performance than directly accessing the physical DUAL table.
-
--

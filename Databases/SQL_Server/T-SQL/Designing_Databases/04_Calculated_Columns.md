@@ -41,6 +41,4 @@ CREATE TABLE dbo.Departments (
     DepartmentID AS DepartmentLocation + '-' + DepartmentCode PERSISTED PRIMARY KEY NOT NULL
 );
 GO
-
-
 ```
