@@ -1,0 +1,916 @@
+import pyodbc
+import pandas as pd
+import traceback
+import datetime
+import getpass
+import socket
+from io import StringIO
+import profile
+import pstats
+from contextlib import contextmanager
+
+def query_sql(connection_string, username, database_name, query, parameters=None, password=None, trusted_connection=False, return_pandas=True):
+ """
+ Execute a parameterized SQL query on a SQL Server database using pyodbc.
+
+ Args:
+ - connection_string (str): The connection string for the SQL Server database.
+ - username (str): The username for authentication.
+ - database_name (str): The name of the database.
+ - query (str): The SQL query with parameters to execute.
+ - parameters (tuple or dict, optional): Parameters to be used in the query. Default is None.
+ - password (str, optional): The password for authentication. Default is None.
+ - trusted_connection (bool, optional): Whether to use Windows authentication. Default is False.
+ - return_pandas (bool, optional): Whether to return data as a Pandas DataFrame. Default is True.
+
+ Returns:
+ - dict: A dictionary containing the following keys:
+ - "timestamp": Timestamp of completion.
+ - "username": Username of the user executing the query.
+ - "machine_name": Name of the machine where the query was executed.
+ - "message": Success message or error message if an error occurred.
+ - "data": Result of the SQL query.
+ - "runtime": Total runtime of the query execution in seconds.
+ """
+ conn = None
+ cursor = None
+ result = {
+ "timestamp": None,
+ "username": getpass.getuser(),
+ "machine_name": socket.gethostname(),
+ "message": None,
+ "data": None,
+ "runtime": None
+ }
+ try:
+ start_time = datetime.datetime.now()
+ 
+ conn_str = f"DRIVER={{SQL Server}};SERVER={connection_string};DATABASE={database_name};"
+ 
+ if trusted_connection:
+ conn_str += "Trusted_Connection=yes;"
+ else:
+ conn_str += f"UID={username};PWD={password};"
+
+ conn = pyodbc.connect(conn_str)
+ cursor = conn.cursor()
+
+ if parameters:
+ cursor.execute(query, parameters)
+ else:
+ cursor.execute(query)
+
+ rows = cursor.fetchall()
+
+ columns = [column[0] for column in cursor.description]
+ data = [dict(zip(columns, row)) for row in rows]
+
+ result["timestamp"] = datetime.datetime.now().isoformat()
+ result["data"] = data if data else []
+ 
+ except pyodbc.Error as e:
+ error_message = f"Error executing query: {e}\n"
+ error_message += traceback.format_exc()
+
+ result["timestamp"] = datetime.datetime.now().isoformat()
+ result["message"] = error_message
+
+ finally:
+ end_time = datetime.datetime.now()
+ result["runtime"] = (end_time - start_time).total_seconds()
+
+ if cursor:
+ cursor.close()
+ if conn:
+ conn.close()
+
+ return result
+
+
+def table_exists(cursor, table_name):
+ """
+ Check if a table exists in the SQL Server database.
+
+ Args:
+ - cursor: pyodbc cursor object.
+ - table_name (str): The name of the table to check.
+
+ Returns:
+ - bool: True if the table exists, False otherwise.
+ """
+ cursor.execute(f"SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = '{table_name}'")
+ return cursor.fetchone() is not None
+
+def generate_create_table_sql(table_name, data_frame):
+ """
+ Generate SQL statement to create a table in SQL Server based on DataFrame columns and data types.
+
+ Args:
+ - table_name (str): The name of the table to create.
+ - data_frame (DataFrame): Pandas DataFrame containing the data.
+
+ Returns:
+ - str: SQL statement to create the table.
+ """
+ columns = ", ".join([f"{col} VARCHAR(MAX)" for col in data_frame.columns])
+ return f"CREATE TABLE {table_name} ({columns});"
+
+def write_to_sql(connection_string, username, database_name, table_name, data_frame, password=None, trusted_connection=False, create_table=False):
+ """
+ Write data from a Pandas DataFrame into a SQL Server table using pyodbc.
+
+ Args:
+ - connection_string (str): The connection string for the SQL Server database.
+ - username (str): The username for authentication.
+ - database_name (str): The name of the database.
+ - table_name (str): The name of the table to write the data into.
+ - data_frame (DataFrame): Pandas DataFrame containing the data to be written into the table.
+ - password (str, optional): The password for authentication. Default is None.
+ - trusted_connection (bool, optional): Whether to use Windows authentication. Default is False.
+ - create_table (bool, optional): Whether to create the table if it doesn't exist. Default is False.
+
+ Returns:
+ - dict: A dictionary containing the following keys:
+ - "timestamp": Timestamp of completion.
+ - "username": Username of the user executing the query.
+ - "machine_name": Name of the machine where the query was executed.
+ - "message": Success message or error message if an error occurred.
+ - "runtime": Total runtime of the query execution in seconds.
+ """
+ conn = None
+ cursor = None
+ result = {
+ "timestamp": None,
+ "username": getpass.getuser(),
+ "machine_name": socket.gethostname(),
+ "message": None,
+ "runtime": None
+ }
+ try:
+ start_time = datetime.datetime.now()
+
+ conn_str = f"DRIVER={{SQL Server}};SERVER={connection_string};DATABASE={database_name};"
+ 
+ if trusted_connection:
+ conn_str += "Trusted_Connection=yes;"
+ else:
+ conn_str += f"UID={username};PWD={password};"
+
+ conn = pyodbc.connect(conn_str)
+ cursor = conn.cursor()
+
+ if create_table:
+ if not table_exists(cursor, table_name):
+ create_table_sql = generate_create_table_sql(table_name, data_frame)
+ cursor.execute(create_table_sql)
+ conn.commit()
+
+ buffer = StringIO()
+ data_frame.to_csv(buffer, index=False, header=False)
+ buffer.seek(0)
+
+ cursor.execute(f"BULK INSERT {table_name} FROM '{buffer}' WITH (FORMAT = 'CSV');")
+ conn.commit()
+
+ result["timestamp"] = datetime.datetime.now().isoformat()
+
+ except pyodbc.Error as e:
+ error_message = f"Error writing to SQL Server table: {e}\n"
+ error_message += traceback.format_exc()
+
+ result["timestamp"] = datetime.datetime.now().isoformat()
+ result["message"] = error_message
+
+ conn.rollback()
+
+ finally:
+ end_time = datetime.datetime.now()
+ result["runtime"] = (end_time - start_time).total_seconds()
+
+ if cursor:
+ cursor.close()
+ if conn:
+ conn.close()
+
+ return result
+
+
+def update_sql(connection_string, username, database_name, table_name, update_data_frame, filters, password=None):
+ """
+ Update records in a SQL Server table based on specified conditions using pyodbc.
+
+ Args:
+ - connection_string (str): The connection string for the SQL Server database.
+ - username (str): The username for authentication.
+ - database_name (str): The name of the database.
+ - table_name (str): The name of the table to update.
+ - update_data_frame (DataFrame): Pandas DataFrame containing columns to update and new values.
+ - filters (dict): Dictionary containing column names and values to filter the data.
+ - password (str, optional): The password for authentication. Default is None.
+
+ Returns:
+ - dict: A dictionary containing the following keys:
+ - "timestamp": Timestamp of completion.
+ - "username": Username of the user executing the query.
+ - "machine_name": Name of the machine where the query was executed.
+ - "message": Success message or error message if an error occurred.
+ - "runtime": Total runtime of the query execution in seconds.
+ """
+ conn = None
+ cursor = None
+ result = {
+ "timestamp": None,
+ "username": getpass.getuser(),
+ "machine_name": socket.gethostname(),
+ "message": None,
+ "runtime": None
+ }
+ try:
+ start_time = datetime.datetime.now()
+
+ conn_str = f"DRIVER={{SQL Server}};SERVER={connection_string};DATABASE={database_name};UID={username};PWD={password};"
+
+ conn = pyodbc.connect(conn_str)
+ cursor = conn.cursor()
+
+ update_query = generate_update_query(table_name, update_data_frame, filters)
+
+ cursor.execute(update_query)
+ conn.commit()
+
+ result["timestamp"] = datetime.datetime.now().isoformat()
+
+ except pyodbc.Error as e:
+ error_message = f"Error updating SQL Server table: {e}\n"
+ error_message += traceback.format_exc()
+
+ result["timestamp"] = datetime.datetime.now().isoformat()
+ result["message"] = error_message
+
+ conn.rollback()
+
+ finally:
+ end_time = datetime.datetime.now()
+ result["runtime"] = (end_time - start_time).total_seconds()
+
+ if cursor:
+ cursor.close()
+ if conn:
+ conn.close()
+
+ return result
+
+def generate_update_query(table_name, update_data_frame, filters):
+ """
+ Generate SQL UPDATE query for SQL Server based on DataFrame columns to update and filter conditions.
+
+ Args:
+ - table_name (str): The name of the table to update.
+ - update_data_frame (DataFrame): Pandas DataFrame containing columns to update and new values.
+ - filters (dict): Dictionary containing column names and values to filter the data.
+
+ Returns:
+ - str: SQL UPDATE query string.
+ """
+ set_values = ", ".join([f"{column} = '{value}'" for column, value in zip(update_data_frame.columns, update_data_frame.values[0])])
+ filter_values = " AND ".join([f"{column} = '{value}'" for column, value in filters.items()])
+ return f"UPDATE {table_name} SET {set_values} WHERE {filter_values};"
+
+
+def delete_from_sql(connection_string, username, database_name, table_name, filters, password=None):
+ """
+ Delete records from a SQL Server table based on specified conditions using pyodbc.
+
+ Args:
+ - connection_string (str): The connection string for the SQL Server database.
+ - username (str): The username for authentication.
+ - database_name (str): The name of the database.
+ - table_name (str): The name of the table to delete records from.
+ - filters (dict): Dictionary containing column names and values to filter the data for deletion.
+ - password (str, optional): The password for authentication. Default is None.
+
+ Returns:
+ - dict: A dictionary containing the following keys:
+ - "timestamp": Timestamp of completion.
+ - "username": Username of the user executing the query.
+ - "machine_name": Name of the machine where the query was executed.
+ - "message": Success message or error message if an error occurred.
+ - "runtime": Total runtime of the query execution in seconds.
+ """
+ conn = None
+ cursor = None
+ result = {
+ "timestamp": None,
+ "username": getpass.getuser(),
+ "machine_name": socket.gethostname(),
+ "message": None,
+ "runtime": None
+ }
+ try:
+ start_time = datetime.datetime.now()
+
+ conn_str = f"DRIVER={{SQL Server}};SERVER={connection_string};DATABASE={database_name};UID={username};PWD={password};"
+
+ conn = pyodbc.connect(conn_str)
+ cursor = conn.cursor()
+
+ delete_query = generate_delete_query(table_name, filters)
+
+ cursor.execute(delete_query)
+ conn.commit()
+
+ result["timestamp"] = datetime.datetime.now().isoformat()
+
+ except pyodbc.Error as e:
+ error_message = f"Error deleting from SQL Server table: {e}\n"
+ error_message += traceback.format_exc()
+
+ result["timestamp"] = datetime.datetime.now().isoformat()
+ result["message"] = error_message
+
+ conn.rollback()
+
+ finally:
+ end_time = datetime.datetime.now()
+ result["runtime"] = (end_time - start_time).total_seconds()
+
+ if cursor:
+ cursor.close()
+ if conn:
+ conn.close()
+
+ return result
+
+def generate_delete_query(table_name, filters):
+ """
+ Generate SQL DELETE query for SQL Server based on filter conditions.
+
+ Args:
+ - table_name (str): The name of the table to delete records from.
+ - filters (dict): Dictionary containing column names and values to filter the data for deletion.
+
+ Returns:
+ - str: SQL DELETE query string.
+ """
+ filter_values = " AND ".join([f"{column} = '{value}'" for column, value in filters.items()])
+ return f"DELETE FROM {table_name} WHERE {filter_values};"
+
+
+# PANDAS STUFF
+
+def compare_dataframes(source_df, compare_df, id_columns):
+ """
+ Compare two Pandas DataFrames and return the differences after checking for data type compatibility.
+
+ Args:
+ - source_df (DataFrame): The source of truth DataFrame.
+ - compare_df (DataFrame): The DataFrame to compare against the source.
+ - id_columns (list): List of column names to identify unique records.
+
+ Returns:
+ - DataFrame: Records that don't exist in compare_df but exist in source_df based on id_columns.
+ - DataFrame: List of values that changed between source_df and compare_df.
+ - DataFrame: List of IDs to delete from compare_df as they don't exist in source_df.
+ """
+
+ # Check for data type compatibility between columns in both DataFrames
+ for column in source_df.columns:
+ if column in compare_df.columns:
+ if source_df[column].dtype != compare_df[column].dtype:
+ raise ValueError(f"Data type mismatch for column '{column}' between DataFrames.")
+
+ # Records that don't exist in compare_df but exist in source_df based on id_columns
+ new_records = source_df[~source_df[id_columns].isin(compare_df[id_columns].values)]
+
+ # List of values that changed between source_df and compare_df
+ changed_values = pd.melt(
+ pd.merge(source_df, compare_df, on=id_columns, how='outer', suffixes=('_source', '_compare')),
+ id_vars=id_columns,
+ var_name='column_name',
+ value_name='value'
+ )
+ changed_values = changed_values[changed_values['value_source'] != changed_values['value_compare']]
+
+ # List of IDs to delete from compare_df as they don't exist in source_df
+ delete_ids = compare_df[~compare_df[id_columns].isin(source_df[id_columns].values)]
+
+ return new_records, changed_values, delete_ids
+
+
+# pandas testing
+class DFTest:
+ """
+ Perform validation tests on Pandas DataFrame columns.
+
+ Attributes:
+ -----------
+ dataframe : pandas.DataFrame
+ The DataFrame to perform validation tests on.
+ tests : list
+ A list to hold test functions and their respective columns.
+
+ Methods:
+ --------
+ add_test(test_func, columns=None):
+ Adds a test function along with columns to be tested.
+ run_tests():
+ Executes all added tests on specified columns and returns the test results.
+ """
+
+ def __init__(self, dataframe):
+ """
+ Constructs a DataFrameTester instance.
+
+ Parameters:
+ -----------
+ dataframe : pandas.DataFrame
+ The DataFrame to perform validation tests on.
+ """
+ if not isinstance(dataframe, pd.DataFrame):
+ raise ValueError("Input is not a Pandas DataFrame")
+ self.dataframe = dataframe
+ self.tests = []
+
+ def add_test(self, test_func, columns=None):
+ """
+ Adds a test function along with columns to be tested.
+
+ Parameters:
+ -----------
+ test_func : function
+ The function representing the test to be performed on columns.
+ columns : list or None, optional (default=None)
+ The columns of the DataFrame on which the test function will be applied.
+ If None, the test will be applied to all columns in the DataFrame.
+ """
+ if columns is None:
+ columns = self.dataframe.columns
+ self.tests.append({'test_func': test_func, 'columns': columns})
+
+ def run_tests(self):
+ """
+ Executes all added tests on specified columns and returns the test results.
+
+ Returns:
+ --------
+ dict
+ A dictionary containing the status of the test run and detailed test results.
+ """
+ results = {}
+ for test in self.tests:
+ test_func = test['test_func']
+ columns = test['columns']
+ test_results = {}
+ for column in columns:
+ test_errors = test_func(self.dataframe[column])
+ if test_errors:
+ test_results[column] = test_errors
+ else:
+ test_results[column] = ['Passed']
+ results[test_func.__name__] = test_results
+
+ status = 'Passed' if all(all(result == ['Passed'] for result in test.values()) for test in results.values()) else 'Failed'
+ return {'status': status, 'test_results': pd.DataFrame(results)}
+
+
+# Example Validation Functions
+def test_non_null_values(column):
+ """
+ Checks if there are any null values in the column.
+
+ Parameters:
+ -----------
+ column : pandas.Series
+ The column to be tested.
+
+ Returns:
+ --------
+ list
+ A list of error messages encountered during the test.
+ """
+ errors = []
+ if column.isnull().any():
+ errors.append("Null values found")
+ return errors
+
+def test_positive_values(column):
+ """
+ Verifies if all values in the column are positive.
+
+ Parameters:
+ -----------
+ column : pandas.Series
+ The column to be tested.
+
+ Returns:
+ --------
+ list
+ A list of error messages encountered during the test.
+ """
+ errors = []
+ if not (column >= 0).all():
+ errors.append("Not all values are positive")
+ return errors
+
+def test_unique_values(column):
+ """
+ Ensures that all values in the column are unique.
+
+ Parameters:
+ -----------
+ column : pandas.Series
+ The column to be tested.
+
+ Returns:
+ --------
+ list
+ A list of error messages encountered during the test.
+ """
+ errors = []
+ if column.nunique() != len(column):
+ errors.append("Values are not unique")
+ return errors
+
+def test_min_max_range(column):
+ """
+ Checks if all values in the column fall within a specified range.
+
+ Parameters:
+ -----------
+ column : pandas.Series
+ The column to be tested.
+
+ Returns:
+ --------
+ list
+ A list of error messages encountered during the test.
+ """
+ errors = []
+ min_val, max_val = 0, 10
+ if not ((column >= min_val) & (column <= max_val)).all():
+ errors.append(f"Not all values in range [{min_val}, {max_val}]")
+ return errors
+
+def test_max_length(column):
+ """
+ Verifies that the length of string values in the column doesn't exceed a certain threshold.
+
+ Parameters:
+ -----------
+ column : pandas.Series
+ The column to be tested.
+
+ Returns:
+ --------
+ list
+ A list of error messages encountered during the test.
+ """
+ errors = []
+ max_length = 10
+ if column.astype(str).str.len().max() > max_length:
+ errors.append(f"Some values exceed max length of {max_length}")
+ return errors
+
+def test_integer_values(column):
+ """
+ Ensures that all values in the column are integers.
+
+ Parameters:
+ -----------
+ column : pandas.Series
+ The column to be tested.
+
+ Returns:
+ --------
+ list
+ A list of error messages encountered during the test.
+ """
+ errors = []
+ if not column.apply(lambda x: isinstance(x, int)).all():
+ errors.append("Not all values are integers")
+ return errors
+
+def test_float_values(column):
+ """
+ Verifies that all values in the column are floats.
+
+ Parameters:
+ -----------
+ column : pandas.Series
+ The column to be tested.
+
+ Returns:
+ --------
+ list
+ A list of error messages encountered during the test.
+ """
+ errors = []
+ if not column.apply(lambda x: isinstance(x, float)).all():
+ errors.append("Not all values are floats")
+ return errors
+
+def test_boolean_values(column):
+ """
+ Checks if all values in the column are boolean (True/False).
+
+ Parameters:
+ -----------
+ column : pandas.Series
+ The column to be tested.
+
+ Returns:
+ --------
+ list
+ A list of error messages encountered during the test.
+ """
+ errors = []
+ if not column.isin([True, False]).all():
+ errors.append("Not all values are boolean")
+ return errors
+
+def test_date_format(column):
+ """
+ Ensures that date values in the column follow a specified date format.
+
+ Parameters:
+ -----------
+ column : pandas.Series
+ The column to be tested.
+
+ Returns:
+ --------
+ list
+ A list of error messages encountered during the test.
+ """
+ errors = []
+ date_format = "%Y-%m-%d"
+ try:
+ pd.to_datetime(column, format=date_format)
+ except ValueError:
+ errors.append(f"Not all values match format {date_format}")
+ return errors
+
+def test_no_duplicates(column):
+ """
+ Verifies that there are no duplicate rows in the column.
+
+ Parameters:
+ -----------
+ column : pandas.Series
+ The column to be tested.
+
+ Returns:
+ --------
+ list
+ A list of error messages encountered during the test.
+ """
+ errors = []
+ if column.duplicated().any():
+ errors.append("Duplicate values found")
+ return errors
+
+def test_no_special_characters(column):
+ """
+ Checks if the column values contain no special characters.
+
+ Parameters:
+ -----------
+ column : pandas.Series
+ The column to be tested.
+
+ Returns:
+ --------
+ list
+ A list of error messages encountered during the test.
+ """
+ errors = []
+ if column.astype(str).str.contains(r"[^a-zA-Z0-9\s]").any():
+ errors.append("Special characters found")
+ return errors
+
+def test_value_in_list(column):
+ """
+ Verifies that all values in the column belong to a predefined list.
+
+ Parameters:
+ -----------
+ column : pandas.Series
+ The column to be tested.
+
+ Returns:
+ --------
+ list
+ A list of error messages encountered during the test.
+ """
+ errors = []
+ valid_values = ['apple', 'banana', 'orange']
+ if not column.isin(valid_values).all():
+ errors.append(f"Not all values belong to {valid_values}")
+ return errors
+
+def test_value_not_in_list(column):
+ """
+ Ensures that no values in the column belong to a predefined list.
+
+ Parameters:
+ -----------
+ column : pandas.Series
+ The column to be tested.
+
+ Returns:
+ --------
+ list
+ A list of error messages encountered during the test.
+ """
+ errors = []
+ invalid_values = ['pear', 'grape', 'kiwi']
+ if column.isin(invalid_values).any():
+ errors.append(f"Some values belong to {invalid_values}")
+ return errors
+
+
+def test_numeric_values(column):
+ """
+ Checks if all values in the column are numeric (integers or floats).
+
+ Parameters:
+ -----------
+ column : pandas.Series
+ The column to be tested.
+
+ Returns:
+ --------
+ list
+ A list of error messages encountered during the test.
+ """
+ errors = []
+ if pd.to_numeric(column, errors='coerce').isnull().any():
+ errors.append("Not all values are numeric")
+ return errors
+
+
+def test_empty_values(column):
+ """
+ Verifies that the column doesn't contain any empty strings or NaN values.
+
+ Parameters:
+ -----------
+ column : pandas.Series
+ The column to be tested.
+
+ Returns:
+ --------
+ list
+ A list of error messages encountered during the test.
+ """
+ errors = []
+ if column.astype(str).str.strip().eq('').any():
+ errors.append("Empty strings found")
+ return errors
+
+
+# SAMPLE USE CASE
+data = {
+ 'A': [1, 2, 3, -4],
+ 'B': ['apple', 'banana', 'apple', 'orange'],
+ 'C': [5, 6, 7, 8]
+}
+df = pd.DataFrame(data)
+
+# Create a DataFrame tester
+tester = DFTest(df)
+
+# Add test functions with specified columns
+tester.add_test(test_positive_values, columns=['A', 'C'])
+tester.add_test(test_unique_values, columns=['B'])
+
+# Run tests on the entire DataFrame
+result = tester.run_tests()
+print(result['status'])
+print(result['test_results'])
+
+
+
+
+# TEST LINKED SERVER
+def test_linked_servers(linked_servers):
+ """
+ Tests multiple SQL Server linked servers and returns the name of the first one that tests successfully.
+
+ Parameters:
+ -----------
+ linked_servers : list of dict
+ A list of dictionaries where each dictionary contains 'server_name', 'database', 'username', and 'password' keys.
+
+ Returns:
+ --------
+ str or None
+ The name of the first linked server that tests successfully. Returns None if none of the servers test successfully.
+ """
+ for server_info in linked_servers:
+ server_name = server_info.get('server_name')
+ database = server_info.get('database')
+ username = server_info.get('username')
+ password = server_info.get('password')
+
+ connection_string = f"DRIVER={{SQL Server}};SERVER={server_name};DATABASE={database};UID={username};PWD={password}"
+ 
+ try:
+ connection = pyodbc.connect(connection_string, timeout=5)
+ cursor = connection.cursor()
+ # Execute sp_testlinkedserver to test the linked server connection
+ cursor.execute(f"EXEC sp_testlinkedserver N'{server_name}'")
+ connection.close()
+ return server_name # Return the first linked server that tests successfully
+ except pyodbc.Error as e:
+ print(f"Failed to test linked server {server_name}: {e}")
+
+ return None # Return None if none of the servers test successfully
+
+# Example usage:
+linked_servers_list = [
+ {'server_name': 'LinkedServer1', 'database': 'Database1', 'username': 'User1', 'password': 'Password1'},
+ {'server_name': 'LinkedServer2', 'database': 'Database2', 'username': 'User2', 'password': 'Password2'},
+ # Add more linked servers as needed
+]
+
+result = test_linked_servers(linked_servers_list)
+
+if result:
+ print(f"The first linked server that tests successfully is: {result}")
+else:
+ print("None of the linked servers test successfully.")
+
+
+# PROFILING
+@contextmanager
+def profile_decorator(output_file=None):
+ """
+ A decorator and context manager for profiling Python code using the profile module.
+
+ Args:
+ output_file (str): Optional. The file to save profiling results. If not provided, results will be printed.
+ 
+ Yields:
+ profile.Profile: The profiler object. When used as a context manager, it yields the profiler for profiling
+ a specific block of code.
+ """
+ profile_filename = "profile.dat"
+ profiler = profile.Profile()
+ 
+ try:
+ profiler.enable()
+ yield profiler
+ finally:
+ profiler.disable()
+ profiler.dump_stats(profile_filename)
+
+ if output_file:
+ with open(output_file, 'w') as f:
+ stats = pstats.Stats(profile_filename, stream=f)
+ stats.sort_stats('cumulative')
+ stats.print_stats()
+ print(f"Profile data saved to: {output_file}")
+ else:
+ stats = pstats.Stats(profile_filename)
+ stats.sort_stats('cumulative')
+ stats.print_stats()
+ print(f"Profile data for {stats.total_calls} function calls:")
+ print(f"{'Function':<40} {'Calls':<10} {'Time (s)':<15} {'Per Call (s)':<15}")
+ for func, (ncalls, tottime, cumtime) in stats.stats.items():
+ print(f"{func:<40} {ncalls:<10} {cumtime:<15.3f} {cumtime / ncalls:<15.6f}")
+
+#PROFILING EXAMPLES
+
+def example_function():
+ """
+ An example function to demonstrate usage of the profile_decorator.
+ """
+ # code to profile
+ for _ in range(1000000):
+ pass
+
+# Using the decorator as a context manager
+with profile_decorator(output_file='my_profile.txt'):
+ example_function()
+
+# Using the decorator without specifying an output file
+with profile_decorator():
+ example_function()
+
+# Using decorator itself
+@profile_decorator(output_file='my_profile.txt')
+def my_function():
+ # code to profile
+ for _ in range(1000000):
+ pass
+
+# Call the decorated function
+my_function()
+
+
+
+
+
+
+
