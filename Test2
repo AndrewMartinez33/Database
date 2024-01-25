@@ -1,0 +1,29 @@
+function sortByColumn(data, columnName, options = {}) {
+  const { descending = false, nullToTop = false } = options;
+
+  return data.sort((a, b) => {
+    const valueA = a[columnName];
+    const valueB = b[columnName];
+
+    // Prioritize null/undefined/blank values if nullToTop is true
+    if ((valueA === null || valueA === undefined || valueA === "") && nullToTop) {
+      return -1;
+    } else if ((valueB === null || valueB === undefined || valueB === "") && nullToTop) {
+      return 1;
+    }
+
+    // Handle cases where both values are null/undefined/blank
+    if (valueA === valueB && (valueA === null || valueA === undefined || valueA === "")) {
+      return 0; // Consider them equal
+    }
+
+    // Perform regular comparison, accounting for descending order
+    if (valueA < valueB) {
+      return descending ? 1 : -1;
+    } else if (valueA > valueB) {
+      return descending ? -1 : 1;
+    } else {
+      return 0;
+    }
+  });
+}
