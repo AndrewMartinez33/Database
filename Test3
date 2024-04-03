@@ -1,0 +1,29 @@
+from datetime import date, timedelta
+from concurrent.futures import ThreadPoolExecutor
+import pandas as pd
+
+def your_function(start_date, end_date):
+  # Your function logic here (should return a pandas DataFrame)
+  # ...
+  return df  # Replace with the actual DataFrame you create
+
+def process_months(current_year):
+  tasks = []
+  for month in range(1, date.today().month):
+    first_day = date(current_year, month, 1)
+    last_day = date(current_year, month, (calendar.monthrange(current_year, month)[1]))
+    tasks.append((first_day, last_day))
+
+  # Create a thread pool with a suitable number of workers
+  with ThreadPoolExecutor() as executor:
+    # Submit tasks and collect results
+    results = executor.map(your_function, *zip(*tasks))
+    # Combine results (assuming all results are DataFrames)
+    combined_df = pd.concat(results, ignore_index=True)  # Concatenate vertically
+
+  return combined_df
+
+if __name__ == "__main__":
+  current_year = date.today().year
+  combined_df = process_months(current_year)
+  print(combined_df)  # Access the combined DataFrame
