@@ -1,0 +1,41 @@
+import pandas as pd
+
+
+def split_dataframe_into_chunks(df, num_chunks):
+    """Splits a pandas DataFrame into a specified number of chunks.
+
+    Args:
+        df (pandas.DataFrame): The DataFrame to split.
+        num_chunks (int): The desired number of chunks.
+
+    Returns:
+        list: A list containing the split DataFrames.
+
+    Raises:
+        ValueError: If the number of chunks is not positive.
+    """
+
+    if num_chunks <= 0:
+        raise ValueError("Number of chunks must be positive.")
+
+    chunk_size = int(len(df) / num_chunks)
+    chunks = [df[i * chunk_size : (i + 1) * chunk_size] for i in range(num_chunks)]
+
+    # Handle the case where the data doesn't divide evenly into chunks
+    if len(chunks) < num_chunks:
+        last_chunk = chunks[-1]
+        for i in range(num_chunks - len(chunks)):
+            chunks.append(last_chunk.copy())
+
+    return chunks
+
+# Example usage
+data = {'col1': [1, 2, 3, 4, 5, 6, 7, 8, 9], 'col2': ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i']}
+df = pd.DataFrame(data)
+num_chunks = 3
+split_chunks = split_dataframe_into_chunks(df.copy(), num_chunks)
+
+# Print the first few rows of each chunk
+for i, chunk in enumerate(split_chunks):
+    print(f"Chunk {i+1}:")
+    print(chunk.head())
