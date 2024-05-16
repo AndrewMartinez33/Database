@@ -1,0 +1,77 @@
+ <div id="modal-container">
+  <dialog id="my-modal" class="modal">
+    <div class="modal-content">
+      <p>This is the modal content.</p>
+      <button id="close-btn">Close</button>
+    </div>
+  </dialog>
+</div>
+
+class Modal {
+  constructor(id) {
+    this.modal = document.getElementById(id);
+    this.closeButton = document.getElementById('close-btn');
+    this.isOpen = false;
+
+    this.closeButton.addEventListener('click', () => this.close());
+  }
+
+  open() {
+    this.modal.showModal();
+    this.modal.classList.add('open'); // Add animation class
+    this.isOpen = true;
+  }
+
+  close() {
+    this.modal.close();
+    this.modal.classList.remove('open');
+    this.isOpen = false;
+  }
+}
+
+const myModal = new Modal('my-modal');
+
+// Example usage
+document.getElementById('open-modal-btn').addEventListener('click', () => {
+  if (!myModal.isOpen) {
+    myModal.open();
+  }
+});
+
+
+
+.modal-container {
+  display: none; /* Hide container initially */
+}
+
+.modal {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 0;
+  background-color: rgba(0, 0, 0, 0.4);
+  transition: height 0.3s ease-in-out;
+  transform: translateY(100%); /* Initially hidden off-screen */
+}
+
+.modal.open {
+  height: calc(100vh - 50px); /* Adjust height as needed */
+  transform: translateY(0);
+}
+
+.modal-content {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background-color: white;
+  padding: 20px;
+  border-radius: 5px;
+}
+
+/* Style the close button */
+#close-btn {
+  /* ... */
+}
+
