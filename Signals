@@ -1,0 +1,39 @@
+# signals.py
+
+from django.db.models.signals import post_save, post_delete
+from django.dispatch import receiver
+from django.contrib.auth.models import User
+from .models import YourModel, ModelChangeLog
+import json
+
+@receiver(post_save, sender=YourModel)
+def log_model_changes(sender, instance, created, **kwargs):
+    action = 'create' if created else 'update'
+    before_data = None
+
+    if not created:
+        try:
+            old_instance = sender.objects.get(pk=instance.pk)
+            before_data = json.dumps({field.name: getattr(old_instance, field.name) for field in old_instance._meta.fields})
+        except sender.DoesNotExist:
+            pass
+
+    after_data = json.dumps({field.name: getattr(instance, field.name) for field in instance._meta.fields})
+
+    ModelChangeLog.objects.create(
+        user=instance.user,  # Assuming your model has a user field
+        action=action,
+        model_name=sender.__name__,
+        before_data=before_data,
+        after_data=after_data
+    )
+
+@receiver(post_delete, sender=YourModel)
+def log_model_deletion(sender, instance, **kwargs):
+    ModelChangeLog.objects.create(
+        user=instance.user,  # Assuming your model has a user field
+        action='delete',
+        model_name=sender.__name__,
+        before_data=json.dumps({field.name: getattr(instance, field.name) for field in instance._meta.fields}),
+        after_data=None
+    )
