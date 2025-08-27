@@ -1,0 +1,281 @@
+
+# datavalidator.py
+
+import re
+import uuid
+import pandas as pd
+import polars as pl
+from datetime import datetime
+
+# ------------------------
+# Validator Implementations
+# ------------------------
+
+def _pandas_is_uuid(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.match(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        na=False,
+    )
+
+def _polars_is_uuid(series: pl.Series) -> pl.Series:
+    return series.str.contains(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    )
+
+def _pandas_is_email(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", na=False)
+
+def _polars_is_email(series: pl.Series) -> pl.Series:
+    return series.str.contains(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+def _pandas_min_length(series: pd.Series, n: int) -> pd.Series:
+    return series.astype(str).str.len() >= n
+
+def _polars_min_length(series: pl.Series, n: int) -> pl.Series:
+    return series.str.len_chars() >= n
+
+def _pandas_max_length(series: pd.Series, n: int) -> pd.Series:
+    return series.astype(str).str.len() <= n
+
+def _polars_max_length(series: pl.Series, n: int) -> pl.Series:
+    return series.str.len_chars() <= n
+
+def _pandas_gt(series: pd.Series, n: float) -> pd.Series:
+    return series > n
+
+def _polars_gt(series: pl.Series, n: float) -> pl.Series:
+    return series > n
+
+def _pandas_lt(series: pd.Series, n: float) -> pd.Series:
+    return series < n
+
+def _polars_lt(series: pl.Series, n: float) -> pl.Series:
+    return series < n
+
+def _pandas_between(series: pd.Series, lo: float, hi: float) -> pd.Series:
+    return (series >= lo) & (series <= hi)
+
+def _polars_between(series: pl.Series, lo: float, hi: float) -> pl.Series:
+    return (series >= lo) & (series <= hi)
+
+def _pandas_pattern(series: pd.Series, regex: str) -> pd.Series:
+    return series.astype(str).str.match(regex, na=False)
+
+def _polars_pattern(series: pl.Series, regex: str) -> pl.Series:
+    return series.str.contains(regex)
+
+def _pandas_is_in(series: pd.Series, values) -> pd.Series:
+    return series.isin(values)
+
+def _polars_is_in(series: pl.Series, values) -> pl.Series:
+    return series.is_in(values)
+
+def _pandas_not_in(series: pd.Series, values) -> pd.Series:
+    return ~series.isin(values)
+
+def _polars_not_in(series: pl.Series, values) -> pl.Series:
+    return ~series.is_in(values)
+
+# --- Required / Not Blank ---
+def _pandas_required(series: pd.Series) -> pd.Series:
+    return series.notna()
+
+def _polars_required(series: pl.Series) -> pl.Series:
+    return series.is_not_null()
+
+def _pandas_not_blank(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.strip().ne("")
+
+def _polars_not_blank(series: pl.Series) -> pl.Series:
+    return series.str.strip_chars().str.len_chars() > 0
+
+def _pandas_not_null(series: pd.Series) -> pd.Series:
+    return series.notna()
+
+def _polars_not_null(series: pl.Series) -> pl.Series:
+    return series.is_not_null()
+
+# --- Date Validators ---
+def _try_parse_date(val, fmt=None):
+    try:
+        if fmt:
+            return datetime.strptime(val, fmt)
+        return datetime.fromisoformat(val)
+    except Exception:
+        return None
+
+def _pandas_is_date(series: pd.Series, fmt=None) -> pd.Series:
+    return series.astype(str).apply(lambda x: _try_parse_date(x, fmt) is not None)
+
+def _polars_is_date(series: pl.Series, fmt=None) -> pl.Series:
+    return series.cast(pl.Datetime, strict=False).is_not_null()
+
+def _pandas_before(series: pd.Series, date_str: str, fmt=None) -> pd.Series:
+    cmp = _try_parse_date(date_str, fmt)
+    return series.astype(str).apply(lambda x: (d := _try_parse_date(x, fmt)) and d < cmp)
+
+def _polars_before(series: pl.Series, date_str: str, fmt=None) -> pl.Series:
+    cmp = datetime.fromisoformat(date_str)
+    return series.cast(pl.Datetime, strict=False) < cmp
+
+def _pandas_after(series: pd.Series, date_str: str, fmt=None) -> pd.Series:
+    cmp = _try_parse_date(date_str, fmt)
+    return series.astype(str).apply(lambda x: (d := _try_parse_date(x, fmt)) and d > cmp)
+
+def _polars_after(series: pl.Series, date_str: str, fmt=None) -> pl.Series:
+    cmp = datetime.fromisoformat(date_str)
+    return series.cast(pl.Datetime, strict=False) > cmp
+
+def _pandas_between_dates(series: pd.Series, start: str, end: str, fmt=None) -> pd.Series:
+    lo = _try_parse_date(start, fmt)
+    hi = _try_parse_date(end, fmt)
+    return series.astype(str).apply(lambda x: (d := _try_parse_date(x, fmt)) and lo <= d <= hi)
+
+def _polars_between_dates(series: pl.Series, start: str, end: str, fmt=None) -> pl.Series:
+    lo, hi = datetime.fromisoformat(start), datetime.fromisoformat(end)
+    d = series.cast(pl.Datetime, strict=False)
+    return (d >= lo) & (d <= hi)
+
+# --- Type Validators ---
+def _pandas_is_int(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce").notna() & (series.astype(str).str.match(r"^-?\d+$"))
+
+def _polars_is_int(series: pl.Series) -> pl.Series:
+    return series.cast(pl.Int64, strict=False).is_not_null()
+
+def _pandas_is_float(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce").notna()
+
+def _polars_is_float(series: pl.Series) -> pl.Series:
+    return series.cast(pl.Float64, strict=False).is_not_null()
+
+def _pandas_is_string(series: pd.Series) -> pd.Series:
+    return series.apply(lambda x: isinstance(x, str))
+
+def _polars_is_string(series: pl.Series) -> pl.Series:
+    return series.dtype == pl.Utf8
+
+def _pandas_is_bool(series: pd.Series) -> pd.Series:
+    return series.apply(lambda x: isinstance(x, bool))
+
+def _polars_is_bool(series: pl.Series) -> pl.Series:
+    return series.dtype == pl.Boolean
+
+def _pandas_is_date_type(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, errors="coerce").notna()
+
+def _polars_is_date_type(series: pl.Series) -> pl.Series:
+    return series.cast(pl.Datetime, strict=False).is_not_null()
+
+# ------------------------
+# Validator Registry
+# ------------------------
+VALIDATORS = {
+    "is_uuid": {"pandas": _pandas_is_uuid, "polars": _polars_is_uuid},
+    "is_email": {"pandas": _pandas_is_email, "polars": _polars_is_email},
+    "min_length": {"pandas": _pandas_min_length, "polars": _polars_min_length},
+    "max_length": {"pandas": _pandas_max_length, "polars": _polars_max_length},
+    "gt": {"pandas": _pandas_gt, "polars": _polars_gt},
+    "lt": {"pandas": _pandas_lt, "polars": _polars_lt},
+    "between": {"pandas": _pandas_between, "polars": _polars_between},
+    "pattern": {"pandas": _pandas_pattern, "polars": _polars_pattern},
+    "is_in": {"pandas": _pandas_is_in, "polars": _polars_is_in},
+    "not_in": {"pandas": _pandas_not_in, "polars": _polars_not_in},
+    "required": {"pandas": _pandas_required, "polars": _polars_required},
+    "not_blank": {"pandas": _pandas_not_blank, "polars": _polars_not_blank},
+    "is_date": {"pandas": _pandas_is_date, "polars": _polars_is_date},
+    "before": {"pandas": _pandas_before, "polars": _polars_before},
+    "after": {"pandas": _pandas_after, "polars": _polars_after},
+    "between_dates": {"pandas": _pandas_between_dates, "polars": _polars_between_dates},
+    "is_int": {"pandas": _pandas_is_int, "polars": _polars_is_int},
+    "is_float": {"pandas": _pandas_is_float, "polars": _polars_is_float},
+    "is_string": {"pandas": _pandas_is_string, "polars": _polars_is_string},
+    "is_bool": {"pandas": _pandas_is_bool, "polars": _polars_is_bool},
+    "is_date_type": {"pandas": _pandas_is_date_type, "polars": _polars_is_date_type},
+    "not_null": {"pandas": _pandas_not_null, "polars": _polars_not_null},
+}
+
+# ------------------------
+# Column DSL
+# ------------------------
+class Column:
+    def __init__(self, name: str, required: bool = True):
+        self.name = name
+        self.required_flag = required
+        self.rules = []
+
+    def _add(self, validator, *args):
+        self.rules.append((validator, args))
+        return self
+
+    # Core
+    def required(self): return self._add("required")
+    def not_blank(self): return self._add("not_blank")
+    def not_null(self): return self._add("not_null")
+
+    # Types
+    def is_int(self): return self._add("is_int")
+    def is_float(self): return self._add("is_float")
+    def is_string(self): return self._add("is_string")
+    def is_bool(self): return self._add("is_bool")
+    def is_date_type(self): return self._add("is_date_type")
+
+    # String
+    def is_uuid(self): return self._add("is_uuid")
+    def is_email(self): return self._add("is_email")
+    def min_length(self, n): return self._add("min_length", n)
+    def max_length(self, n): return self._add("max_length", n)
+    def pattern(self, regex): return self._add("pattern", regex)
+
+    # Numeric
+    def gt(self, n): return self._add("gt", n)
+    def lt(self, n): return self._add("lt", n)
+    def between(self, lo, hi): return self._add("between", lo, hi)
+    def is_in(self, values): return self._add("is_in", values)
+    def not_in(self, values): return self._add("not_in", values)
+
+    # Dates
+    def is_date(self, fmt=None): return self._add("is_date", fmt)
+    def before(self, date_str, fmt=None): return self._add("before", date_str, fmt)
+    def after(self, date_str, fmt=None): return self._add("after", date_str, fmt)
+    def between_dates(self, start, end, fmt=None): return self._add("between_dates", start, end, fmt)
+
+# ------------------------
+# Validator Runner
+# ------------------------
+class DataValidator:
+    def __init__(self, backend="pandas"):
+        if backend not in ("pandas", "polars"):
+            raise ValueError("backend must be 'pandas' or 'polars'")
+        self.backend = backend
+        self.columns = []
+
+    def add_column(self, column: Column):
+        self.columns.append(column)
+        return self
+
+    def validate(self, df):
+        errors = []
+        for col in self.columns:
+            if col.name not in df.columns:
+                if col.required_flag:
+                    errors.append((None, col.name, "Missing required column"))
+                continue
+
+            series = df[col.name]
+            for validator, args in col.rules:
+                func = VALIDATORS[validator][self.backend]
+                mask = func(series, *args) if args else func(series)
+                # Convert Polars Series to NumPy array for index
+                if self.backend == "polars":
+                    mask = mask.to_numpy()
+                invalid_idx = (~mask).nonzero()[0]
+                for i in invalid_idx:
+                    errors.append((i, col.name, f"Failed {validator}"))
+        return errors
+
+    def raise_for_errors(self, df):
+        errs = self.validate(df)
+        if errs:
+            raise ValueError(f"Validation failed: {errs}")
+
