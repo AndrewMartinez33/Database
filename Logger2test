@@ -1,0 +1,207 @@
+"""
+python decorator for function execution logging with partial redaction support.
+Features:
+- Execution ID (UUID)
+- Function name
+- Args/kwargs (optional, redactable, JSON-safe)
+- Partial redaction via `redact_fields`
+- Return type (optional)
+- Start/end timestamps (UTC)
+- Execution time
+- Error details
+- Hostname and username
+- Custom metadata
+- Log levels: INFO (success), WARNING (slow), ERROR (exceptions)
+- Slow function warnings via threshold
+- Supports sync and async functions
+- Fail-safe logging
+"""
+
+import functools
+import inspect
+import json
+import os
+import socket
+import time
+import traceback
+import uuid
+import logging
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, Optional, List
+
+
+def capture_execution(
+    log_handler: Callable[[Dict[str, Any], int], None],
+    *,
+    log_args: bool = True,
+    redact: bool = False,
+    redact_fields: Optional[List[str]] = None,
+    log_return: bool = True,
+    extra: Optional[Dict[str, Any]] = None,
+    slow_threshold: Optional[float] = None,
+    log_level: Optional[Dict[str, int]] = None
+):
+    """
+    Decorator to capture function execution details with full production features.
+
+    Parameters
+    ----------
+    log_handler : Callable[[Dict[str, Any], int], None]
+        Function that handles the log entry and receives log level.
+    log_args : bool, optional
+        Include args/kwargs in log.
+    redact : bool, optional
+        Replace all args/kwargs with "<REDACTED>".
+    redact_fields : list of str, optional
+        Names of arguments to redact (partial redaction). Overrides `redact`.
+    log_return : bool, optional
+        Include return type in log.
+    extra : dict, optional
+        Custom metadata to include in each log entry.
+    slow_threshold : float, optional
+        Execution time (seconds) to trigger WARNING log.
+    log_level : dict, optional
+        Dictionary defining log levels for "success", "slow", "exception".
+    """
+
+    hostname = socket.gethostname()
+    username = os.getenv("USER") or os.getenv("USERNAME") or "unknown"
+    extra = extra or {}
+
+    log_level = log_level or {
+        "success": logging.INFO,
+        "slow": logging.WARNING,
+        "exception": logging.ERROR
+    }
+
+    def now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def safe_serialize(obj: Any):
+        try:
+            json.dumps(obj)
+            return obj
+        except (TypeError, OverflowError):
+            return str(obj)
+
+    def make_log_entry(func: Callable, exec_id: str, args, kwargs):
+        entry = {
+            "execution_id": exec_id,
+            "function": func.__qualname__,
+            "args": None,
+            "kwargs": None,
+            "error": None,
+            "return_type": None,
+            "start_time": now_iso(),
+            "end_time": None,
+            "execution_time": None,
+            "hostname": hostname,
+            "username": username,
+        }
+        entry.update(extra)
+
+        if redact_fields:
+            # Partial redaction based on argument names
+            sig = inspect.signature(func)
+            bound = sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+
+            redacted_args = []
+            redacted_kwargs = {}
+
+            for name, value in bound.arguments.items():
+                if name in redact_fields:
+                    value = "<REDACTED>"
+                if sig.parameters[name].kind in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD
+                ):
+                    redacted_args.append(safe_serialize(value))
+                else:
+                    redacted_kwargs[name] = safe_serialize(value)
+
+            entry["args"] = redacted_args if redacted_args else None
+            entry["kwargs"] = redacted_kwargs if redacted_kwargs else None
+
+        elif redact:
+            # Full redaction
+            entry["args"] = "<REDACTED>"
+            entry["kwargs"] = "<REDACTED>"
+        elif log_args:
+            # Log normally
+            entry["args"] = safe_serialize(args)
+            entry["kwargs"] = safe_serialize(kwargs)
+
+        return entry
+
+    def decorator(func: Callable):
+        is_async = inspect.iscoroutinefunction(func)
+
+        def determine_log_level(exec_time: float, error: Optional[dict]):
+            if error:
+                return log_level.get("exception", logging.ERROR)
+            if slow_threshold and exec_time >= slow_threshold:
+                return log_level.get("slow", logging.WARNING)
+            return log_level.get("success", logging.INFO)
+
+        if not is_async:
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                exec_id = str(uuid.uuid4())
+                start_time = time.perf_counter()
+                log_entry = make_log_entry(func, exec_id, args, kwargs)
+
+                try:
+                    result = func(*args, **kwargs)
+                    if log_return:
+                        log_entry["return_type"] = type(result).__name__
+                    return result
+                except Exception as exc:
+                    log_entry["error"] = {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "traceback": traceback.format_exc()
+                    }
+                    raise
+                finally:
+                    log_entry["end_time"] = now_iso()
+                    log_entry["execution_time"] = time.perf_counter() - start_time
+                    try:
+                        level = determine_log_level(log_entry["execution_time"], log_entry["error"])
+                        log_handler(log_entry, level)
+                    except Exception:
+                        pass
+
+            return wrapper
+
+        else:
+            @functools.wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                exec_id = str(uuid.uuid4())
+                start_time = time.perf_counter()
+                log_entry = make_log_entry(func, exec_id, args, kwargs)
+
+                try:
+                    result = await func(*args, **kwargs)
+                    if log_return:
+                        log_entry["return_type"] = type(result).__name__
+                    return result
+                except Exception as exc:
+                    log_entry["error"] = {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "traceback": traceback.format_exc()
+                    }
+                    raise
+                finally:
+                    log_entry["end_time"] = now_iso()
+                    log_entry["execution_time"] = time.perf_counter() - start_time
+                    try:
+                        level = determine_log_level(log_entry["execution_time"], log_entry["error"])
+                        log_handler(log_entry, level)
+                    except Exception:
+                        pass
+
+            return async_wrapper
+
+    return decorator
