@@ -1,0 +1,162 @@
+import pandas as pd
+import numpy as np
+from typing import List, Tuple, Union, Optional
+
+def find_text_coordinates(
+    file_path: str, 
+    search_term: str, 
+    sheet_name: Union[str, int] = 0,
+    case_sensitive: bool = False,
+    exact_match: bool = False
+) -> List[Tuple[int, str]]:
+    """
+    Search for specific text in an Excel file and return coordinates of all matches.
+    
+    Args:
+        file_path (str): Path to the Excel file
+        search_term (str): Text to search for
+        sheet_name (Union[str, int]): Sheet name or index (default: 0 for first sheet)
+        case_sensitive (bool): Whether search should be case sensitive (default: False)
+        exact_match (bool): Whether to match exact cell content only (default: False)
+    
+    Returns:
+        List[Tuple[int, str]]: List of tuples containing (row_number, column_name) 
+                              where matches were found (1-indexed row numbers)
+    
+    Raises:
+        FileNotFoundError: If the Excel file doesn't exist
+        ValueError: If the sheet doesn't exist or search term is empty
+        Exception: For other Excel reading errors
+    """
+    
+    if not search_term.strip():
+        raise ValueError("Search term cannot be empty")
+    
+    try:
+        # Read Excel file into DataFrame
+        df = pd.read_excel(file_path, sheet_name=sheet_name, dtype=str, na_filter=False)
+        
+        # Convert search term based on case sensitivity
+        search_value = search_term if case_sensitive else search_term.lower()
+        
+        coordinates = []
+        
+        # Iterate through each cell in the DataFrame
+        for row_idx in range(len(df)):
+            for col_name in df.columns:
+                cell_value = str(df.iloc[row_idx, df.columns.get_loc(col_name)])
+                
+                # Handle case sensitivity
+                comparison_value = cell_value if case_sensitive else cell_value.lower()
+                
+                # Check for match based on exact_match parameter
+                if exact_match:
+                    is_match = comparison_value == search_value
+                else:
+                    is_match = search_value in comparison_value
+                
+                if is_match:
+                    # Store 1-indexed row number and column name
+                    coordinates.append((row_idx + 2, str(col_name)))  # +2 because pandas is 0-indexed and Excel headers are row 1
+        
+        return coordinates
+        
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Excel file not found: {file_path}")
+    except ValueError as e:
+        if "Worksheet" in str(e):
+            raise ValueError(f"Sheet '{sheet_name}' not found in the Excel file")
+        raise e
+    except Exception as e:
+        raise Exception(f"Error reading Excel file: {str(e)}")
+
+
+def find_text_coordinates_advanced(
+    file_path: str, 
+    search_terms: Union[str, List[str]], 
+    sheet_name: Union[str, int] = 0,
+    case_sensitive: bool = False,
+    exact_match: bool = False,
+    return_cell_values: bool = False
+) -> Union[List[Tuple[int, str]], dict]:
+    """
+    Advanced version that can search for multiple terms and optionally return cell values.
+    
+    Args:
+        file_path (str): Path to the Excel file
+        search_terms (Union[str, List[str]]): Single term or list of terms to search for
+        sheet_name (Union[str, int]): Sheet name or index (default: 0)
+        case_sensitive (bool): Whether search should be case sensitive (default: False)
+        exact_match (bool): Whether to match exact cell content only (default: False)
+        return_cell_values (bool): Whether to include actual cell values in results (default: False)
+    
+    Returns:
+        Union[List[Tuple[int, str]], dict]: If single search term and not return_cell_values,
+                                           returns list of coordinates. Otherwise returns dict
+                                           with search terms as keys and results as values.
+    """
+    
+    # Convert single search term to list for consistent processing
+    if isinstance(search_terms, str):
+        terms_list = [search_terms]
+        single_term = True
+    else:
+        terms_list = search_terms
+        single_term = False
+    
+    results = {}
+    
+    for term in terms_list:
+        coordinates = []
+        
+        try:
+            df = pd.read_excel(file_path, sheet_name=sheet_name, dtype=str, na_filter=False)
+            search_value = term if case_sensitive else term.lower()
+            
+            for row_idx in range(len(df)):
+                for col_name in df.columns:
+                    cell_value = str(df.iloc[row_idx, df.columns.get_loc(col_name)])
+                    comparison_value = cell_value if case_sensitive else cell_value.lower()
+                    
+                    if exact_match:
+                        is_match = comparison_value == search_value
+                    else:
+                        is_match = search_value in comparison_value
+                    
+                    if is_match:
+                        if return_cell_values:
+                            coordinates.append((row_idx + 2, str(col_name), cell_value))
+                        else:
+                            coordinates.append((row_idx + 2, str(col_name)))
+            
+            results[term] = coordinates
+            
+        except Exception as e:
+            results[term] = f"Error: {str(e)}"
+    
+    # Return format based on input and parameters
+    if single_term and not return_cell_values:
+        return results[terms_list[0]]
+    else:
+        return results
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Example usage
+    try:
+        # Basic usage
+        matches = find_text_coordinates("data.xlsx", "search_term")
+        print(f"Found matches at coordinates: {matches}")
+        
+        # Advanced usage with multiple terms
+        multiple_results = find_text_coordinates_advanced(
+            "data.xlsx", 
+            ["term1", "term2"], 
+            case_sensitive=True,
+            return_cell_values=True
+        )
+        print(f"Multiple search results: {multiple_results}")
+        
+    except Exception as e:
+        print(f"Error: {e}")
