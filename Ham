@@ -1,0 +1,142 @@
+from dataclasses import dataclass
+from typing import Iterable, List, Tuple, Dict, Optional, Any, Union
+import re
+from openpyxl import load_workbook
+import pandas as pd
+
+
+@dataclass
+class SectionPair:
+    name: str
+    start: Union[str, re.Pattern]
+    end: Union[str, re.Pattern]
+    match_mode: str = "contains"  # 'contains' | 'equals' | 'regex'
+
+
+@dataclass
+class FoundSection:
+    sheet_name: str
+    section_name: str
+    start_row: int  # inclusive
+    end_row: int    # inclusive
+    rows: Optional[List[Tuple[Any, ...]]] = None
+    dataframe: Optional[pd.DataFrame] = None
+
+
+class ExcelSectionExtractor:
+    def __init__(self, pairs: Iterable[SectionPair], use_row_join: bool = False):
+        self.pairs: List[SectionPair] = []
+        self.use_row_join = use_row_join
+
+        for p in pairs:
+            if p.match_mode not in {"contains", "equals", "regex"}:
+                raise ValueError("match_mode must be 'contains', 'equals', or 'regex'")
+            if p.match_mode in {"contains", "equals"}:
+                p.start = p.start.lower()
+                p.end = p.end.lower()
+            elif p.match_mode == "regex":
+                if not isinstance(p.start, re.Pattern):
+                    p.start = re.compile(p.start)
+                if not isinstance(p.end, re.Pattern):
+                    p.end = re.compile(p.end)
+            self.pairs.append(p)
+
+    def _row_as_string(self, row: Tuple[Any, ...]) -> str:
+        return " ".join(str(c) for c in row if c is not None)
+
+    def _row_matches(
+        self, row: Tuple[Any, ...], pattern: Union[str, re.Pattern], mode: str
+    ) -> bool:
+        if self.use_row_join:
+            row_str = self._row_as_string(row)
+            if mode == "contains":
+                return pattern in row_str.lower()
+            if mode == "equals":
+                return pattern == row_str.lower()
+            if mode == "regex":
+                return bool(pattern.search(row_str))
+            return False
+        else:
+            for cell in row:
+                if cell is None:
+                    continue
+                s = str(cell)
+                if mode == "contains":
+                    if pattern in s.lower():
+                        return True
+                elif mode == "equals":
+                    if pattern == s.lower():
+                        return True
+                elif mode == "regex":
+                    if pattern.search(s):
+                        return True
+            return False
+
+    def analyze_file(
+        self,
+        filepath: str,
+        sheet_names: Optional[Iterable[str]] = None,
+        return_dataframes: bool = False,
+        auto_close: bool = False,
+    ) -> Dict[str, List[FoundSection]]:
+        wb = load_workbook(filename=filepath, read_only=True, data_only=True)
+        try:
+            target_sheets = sheet_names if sheet_names is not None else wb.sheetnames
+            results: Dict[str, List[FoundSection]] = {}
+
+            for sheet_name in target_sheets:
+                if sheet_name not in wb.sheetnames:
+                    continue
+                ws = wb[sheet_name]
+                found: List[FoundSection] = []
+                open_sections: Dict[int, int] = {}
+                row_buffer: Dict[int, List[Tuple[Any, ...]]] = {}
+                last_row_idx = 0
+
+                for idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+                    last_row_idx = idx
+                    for pi, pair in enumerate(self.pairs):
+                        if pi not in open_sections:
+                            # Look for start
+                            if self._row_matches(row, pair.start, pair.match_mode):
+                                open_sections[pi] = idx
+                                row_buffer[pi] = [row]  # include start row
+                        else:
+                            # Add row to buffer (between start and end)
+                            row_buffer[pi].append(row)
+
+                            # Look for end
+                            if self._row_matches(row, pair.end, pair.match_mode):
+                                rows = row_buffer.pop(pi)
+                                df = pd.DataFrame(rows) if return_dataframes else None
+                                found.append(
+                                    FoundSection(
+                                        sheet_name=sheet_name,
+                                        section_name=pair.name,
+                                        start_row=open_sections.pop(pi),
+                                        end_row=idx,
+                                        rows=rows,
+                                        dataframe=df,
+                                    )
+                                )
+
+                # auto-close unclosed sections
+                if auto_close and open_sections:
+                    for pi, start_row in open_sections.items():
+                        rows = row_buffer.get(pi, [])
+                        df = pd.DataFrame(rows) if return_dataframes else None
+                        found.append(
+                            FoundSection(
+                                sheet_name=sheet_name,
+                                section_name=self.pairs[pi].name,
+                                start_row=start_row,
+                                end_row=last_row_idx,
+                                rows=rows,
+                                dataframe=df,
+                            )
+                        )
+
+                results[sheet_name] = found
+            return results
+        finally:
+            wb.close()
