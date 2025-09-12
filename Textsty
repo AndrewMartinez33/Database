@@ -1,0 +1,167 @@
+
+from dataclasses import dataclass
+from typing import Iterable, List, Tuple, Dict, Optional, Any, Union
+import re
+from openpyxl import load_workbook
+import pandas as pd
+
+
+@dataclass
+class SectionPair:
+    """
+    Defines a start/end keyword pair.
+    Example: SectionPair(name="ProjectBlock", start="Project1", end="ETA")
+    """
+    name: str
+    start: Union[str, re.Pattern]
+    end: Union[str, re.Pattern]
+    match_mode: str = "contains" # 'contains' | 'equals' | 'regex'
+
+
+@dataclass
+class FoundSection:
+    sheet_name: str
+    section_name: str
+    start_row: int # inclusive
+    end_row: int # inclusive
+    dataframe: Optional[pd.DataFrame] = None # optional rows as pandas DF
+
+
+class ExcelSectionExtractor:
+    """
+    Extracts *all occurrences* of sections from Excel files
+    based on explicit start/end keyword pairs.
+    """
+
+    def __init__(self, pairs: Iterable[SectionPair], use_row_join: bool = False):
+        """
+        :param pairs: list of SectionPair
+        :param use_row_join: if True, join all cell strings in a row and match once
+        """
+        self.pairs: List[SectionPair] = []
+        self.use_row_join = use_row_join
+
+        for p in pairs:
+            if p.match_mode not in {"contains", "equals", "regex"}:
+                raise ValueError("match_mode must be 'contains', 'equals', or 'regex'")
+            # normalize case for string modes
+            if p.match_mode in {"contains", "equals"}:
+                p.start = p.start.lower()
+                p.end = p.end.lower()
+            # precompile regex if needed
+            elif p.match_mode == "regex":
+                if not isinstance(p.start, re.Pattern):
+                    p.start = re.compile(p.start)
+                if not isinstance(p.end, re.Pattern):
+                    p.end = re.compile(p.end)
+            self.pairs.append(p)
+
+    def _row_as_string(self, row: Tuple[Any, ...]) -> str:
+        """Join row cells into a single string for fast matching."""
+        return " ".join(str(c) for c in row if c is not None)
+
+    def _row_matches(
+        self, row: Tuple[Any, ...], pattern: Union[str, re.Pattern], mode: str
+    ) -> bool:
+        if self.use_row_join:
+            row_str = self._row_as_string(row)
+            if mode == "contains":
+                return pattern in row_str.lower()
+            if mode == "equals":
+                return pattern == row_str.lower()
+            if mode == "regex":
+                return bool(pattern.search(row_str))
+            return False
+        else:
+            for cell in row:
+                if cell is None:
+                    continue
+                s = str(cell)
+                if mode == "contains":
+                    if pattern in s.lower():
+                        return True
+                elif mode == "equals":
+                    if pattern == s.lower():
+                        return True
+                elif mode == "regex":
+                    if pattern.search(s):
+                        return True
+            return False
+
+    def analyze_file(
+        self,
+        filepath: str,
+        sheet_names: Optional[Iterable[str]] = None,
+        return_dataframes: bool = False,
+        auto_close: bool = False,
+    ) -> Dict[str, List[FoundSection]]:
+        """
+        Analyze Excel file and return dict of sections found per sheet.
+
+        If return_dataframes=True, each FoundSection includes a pandas DataFrame
+        of the section rows.
+        If auto_close=True, unclosed sections are closed at the last row.
+        """
+        wb = load_workbook(filename=filepath, read_only=True, data_only=True)
+        try:
+            target_sheets = sheet_names if sheet_names is not None else wb.sheetnames
+            results: Dict[str, List[FoundSection]] = {}
+
+            for sheet_name in target_sheets:
+                if sheet_name not in wb.sheetnames:
+                    continue
+                ws = wb[sheet_name]
+                found: List[FoundSection] = []
+                open_sections: Dict[int, int] = {} # pair_index -> start_row
+                row_buffer: Dict[int, List[Tuple[Any, ...]]] = {}
+                last_row_idx = 0
+
+                for idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+                    last_row_idx = idx
+                    for pi, pair in enumerate(self.pairs):
+                        if pi not in open_sections:
+                            # look for a new start
+                            if self._row_matches(row, pair.start, pair.match_mode):
+                                open_sections[pi] = idx
+                                if return_dataframes:
+                                    row_buffer[pi] = [row]
+                        else:
+                            # accumulate row
+                            if return_dataframes:
+                                row_buffer[pi].append(row)
+                            # look for end
+                            if self._row_matches(row, pair.end, pair.match_mode):
+                                df = None
+                                if return_dataframes:
+                                    df = pd.DataFrame(row_buffer.pop(pi))
+                                found.append(
+                                    FoundSection(
+                                        sheet_name=sheet_name,
+                                        section_name=pair.name,
+                                        start_row=open_sections.pop(pi),
+                                        end_row=idx,
+                                        dataframe=df,
+                                    )
+                                )
+
+                # auto-close unclosed sections
+                if auto_close and open_sections:
+                    for pi, start_row in open_sections.items():
+                        df = None
+                        if return_dataframes:
+                            df = pd.DataFrame(row_buffer.get(pi, []))
+                        found.append(
+                            FoundSection(
+                                sheet_name=sheet_name,
+                                section_name=self.pairs[pi].name,
+                                start_row=start_row,
+                                end_row=last_row_idx,
+                                dataframe=df,
+                            )
+                        )
+
+                results[sheet_name] = found
+            return results
+        finally:
+            wb.close()
+
