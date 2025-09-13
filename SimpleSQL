@@ -1,0 +1,244 @@
+import pyodbc
+import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Callable, Dict, List, Optional, Tuple, Generator
+import decimal
+
+
+class SimpleSQL:
+    def __init__(self, connection_string: str, error_handler: Optional[Callable] = None,
+                 redact_params: bool = False, default_timeout: int = 30):
+        self.connection_string = connection_string
+        self.error_handler = error_handler
+        self.redact_params = redact_params
+        self.default_timeout = default_timeout
+
+    # ---------------- Internal Helpers ----------------
+    def _connect(self):
+        conn = pyodbc.connect(self.connection_string, timeout=self.default_timeout)
+        conn.autocommit = False
+        return conn
+
+    def _handle_error(self, err: Exception, query: Optional[str] = None, params: Optional[Any] = None):
+        if self.error_handler:
+            safe_params = None if self.redact_params else params
+            self.error_handler(err, query, safe_params)
+        else:
+            raise
+
+    def _quote_identifier(self, name: str) -> str:
+        parts = name.split(".")
+        return ".".join([f"[{p.strip('[]')}]" for p in parts])
+
+    def _map_dtype(self, dtype, series=None) -> str:
+        if pd.api.types.is_integer_dtype(dtype):
+            return "BIGINT"
+        if pd.api.types.is_float_dtype(dtype):
+            return "FLOAT"
+        if pd.api.types.is_bool_dtype(dtype):
+            return "BIT"
+        if pd.api.types.is_datetime64_any_dtype(dtype):
+            return "DATETIME2"
+        if pd.api.types.is_categorical_dtype(dtype):
+            return "NVARCHAR(255)"
+        if pd.api.types.is_string_dtype(dtype) or dtype == object:
+            max_len = series.astype(str).str.len().max() if series is not None else 255
+            max_len = 255 if pd.isna(max_len) else int(min(max_len, 4000))
+            return f"NVARCHAR({max_len})"
+        if dtype == decimal.Decimal:
+            return "DECIMAL(38,10)"
+        return "NVARCHAR(MAX)"
+
+    # ---------------- Core Methods ----------------
+    def query(self, sql: str, params: Optional[Tuple] = None, fetch: str = "all") -> List[Tuple]:
+        try:
+            with self._connect() as conn:
+                cur = conn.cursor()
+                cur.execute(sql, params or ())
+                if fetch == "all":
+                    return cur.fetchall()
+                elif fetch == "one":
+                    return cur.fetchone()
+                else:
+                    return []
+        except Exception as e:
+            self._handle_error(e, sql, params)
+
+    def iter_query(self, sql: str, params: Optional[Tuple] = None, batch_size: int = 1000) -> Generator[List[Tuple], None, None]:
+        try:
+            with self._connect() as conn:
+                cur = conn.cursor()
+                cur.execute(sql, params or ())
+                while True:
+                    rows = cur.fetchmany(batch_size)
+                    if not rows:
+                        break
+                    yield rows
+        except Exception as e:
+            self._handle_error(e, sql, params)
+
+    def query_pandas(self, sql: str, params: Optional[Tuple] = None) -> pd.DataFrame:
+        try:
+            with self._connect() as conn:
+                return pd.read_sql(sql, conn, params=params)
+        except Exception as e:
+            self._handle_error(e, sql, params)
+
+    def query_pandas_stream(self, sql: str, params: Optional[Tuple] = None, chunksize: int = 10000):
+        try:
+            with self._connect() as conn:
+                return pd.read_sql(sql, conn, params=params, chunksize=chunksize)
+        except Exception as e:
+            self._handle_error(e, sql, params)
+
+    def execute(self, sql: str, params: Optional[Tuple] = None) -> None:
+        try:
+            with self._connect() as conn:
+                cur = conn.cursor()
+                cur.execute(sql, params or ())
+                conn.commit()
+        except Exception as e:
+            self._handle_error(e, sql, params)
+
+    def query_many(self, sql: str, param_list: List[Tuple], max_workers: int = 4) -> List[Any]:
+        results = []
+        try:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(self.query, sql, p) for p in param_list]
+                for f in as_completed(futures):
+                    results.append(f.result())
+            return results
+        except Exception as e:
+            self._handle_error(e, sql, param_list)
+
+    def write_table(
+        self,
+        df: pd.DataFrame,
+        table_name: str,
+        truncate: bool = False,
+        delete: bool = False,
+        drop_table: bool = False,
+        create_table: bool = False,
+        batch_size: int = 1000,
+        dtype_overrides: Optional[Dict[str, str]] = None,
+    ):
+        try:
+            q_table = self._quote_identifier(table_name)
+            with self._connect() as conn:
+                cur = conn.cursor()
+                cur.fast_executemany = True
+
+                if drop_table:
+                    cur.execute(f"IF OBJECT_ID('{table_name}', 'U') IS NOT NULL DROP TABLE {q_table}")
+                if create_table:
+                    cols = []
+                    for col in df.columns:
+                        override = dtype_overrides.get(col) if dtype_overrides else None
+                        sql_type = override or self._map_dtype(df[col].dtype, df[col])
+                        cols.append(f"[{col}] {sql_type}")
+                    col_defs = ", ".join(cols)
+                    cur.execute(f"CREATE TABLE {q_table} ({col_defs})")
+                if truncate:
+                    cur.execute(f"TRUNCATE TABLE {q_table}")
+                elif delete:
+                    cur.execute(f"DELETE FROM {q_table}")
+
+                placeholders = ",".join("?" for _ in df.columns)
+                insert_sql = f"INSERT INTO {q_table} ({','.join(f'[{c}]' for c in df.columns)}) VALUES ({placeholders})"
+                data = df.values.tolist()
+                for i in range(0, len(data), batch_size):
+                    cur.executemany(insert_sql, data[i:i + batch_size])
+                conn.commit()
+        except Exception as e:
+            self._handle_error(e, f"write_table {table_name}", None)
+
+    # ---------------- Stored Procedure Support ----------------
+    def run_procedure(
+        self,
+        proc_name: str,
+        params: Optional[Tuple] = None,
+        output_params: Optional[List[str]] = None,
+        capture_return: bool = False
+    ) -> dict:
+        try:
+            with self._connect() as conn:
+                cur = conn.cursor()
+                sql_parts = []
+
+                # Declare RETURN value
+                if capture_return:
+                    sql_parts.append("DECLARE @ret int;")
+
+                # Declare output parameters
+                if output_params:
+                    for p in output_params:
+                        sql_parts.append(f"DECLARE @{p} sql_variant;")
+
+                # Build EXEC statement
+                exec_parts = []
+                if params:
+                    exec_parts.extend("?" for _ in params)
+                if output_params:
+                    exec_parts.extend(f"@{p}=@{p} OUTPUT" for p in output_params)
+
+                exec_statement = f"EXEC "
+                if capture_return:
+                    exec_statement += "@ret = "
+                exec_statement += f"{proc_name} "
+                exec_statement += ", ".join(exec_parts)
+                sql_parts.append(exec_statement)
+
+                # Select return and output values
+                if capture_return:
+                    sql_parts.append("SELECT @ret AS return_value;")
+                if output_params:
+                    select_outputs = ", ".join(f"@{p} AS {p}" for p in output_params)
+                    sql_parts.append(f"SELECT {select_outputs};")
+
+                final_sql = "\n".join(sql_parts)
+                cur.execute(final_sql, params or ())
+
+                results = []
+                try:
+                    results = cur.fetchall()
+                except pyodbc.ProgrammingError:
+                    results = []
+
+                return_value = None
+                output_values = {}
+                if capture_return and cur.nextset():
+                    return_value = cur.fetchone()[0]
+                if output_params and cur.nextset():
+                    row = cur.fetchone()
+                    if row:
+                        output_values = {name: row[i] for i, name in enumerate(output_params)}
+
+                return {"results": results, "return_value": return_value, "output": output_values}
+
+        except Exception as e:
+            self._handle_error(e, proc_name, params)
+
+    # ---------------- Metadata Helpers ----------------
+    def get_tables(self) -> List[str]:
+        try:
+            with self._connect() as conn:
+                cur = conn.cursor()
+                cur.tables(tableType="TABLE")
+                return [row.table_name for row in cur.fetchall()]
+        except Exception as e:
+            self._handle_error(e, "get_tables", None)
+
+    def get_schema(self, table_name: str) -> List[Tuple]:
+        try:
+            with self._connect() as conn:
+                cur = conn.cursor()
+                return [(col.column_name, col.type_name, col.column_size) for col in cur.columns(table=table_name)]
+        except Exception as e:
+            self._handle_error(e, "get_schema", table_name)
+
+    def row_count(self, table_name: str) -> int:
+        try:
+            sql = f"SELECT COUNT(*) FROM {self._quote_identifier(table_name)}"
+            return self.query(sql, fetch="one")[0]
+        except Exception as e:
+            self._handle_error(e, "row_count", table_name)
