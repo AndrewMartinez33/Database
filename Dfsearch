@@ -1,0 +1,68 @@
+import pandas as pd
+import numpy as np
+import re
+from typing import Any, List, Dict, Union
+
+Keyword = Union[str, int, float, re.Pattern, List[Union[str, int, float, re.Pattern]]]
+
+
+class DataFrameKeywordSearcher:
+    def __init__(self, df: pd.DataFrame):
+        self.df = df
+
+    def _match_vectorized(self, keyword: Keyword) -> pd.Series:
+        """
+        Return a boolean Series marking rows where keyword matches.
+        Supports str, number, regex, or list of these.
+        """
+        if isinstance(keyword, list):
+            masks = [self._match_vectorized(k) for k in keyword]
+            return np.logical_or.reduce(masks)
+
+        if isinstance(keyword, re.Pattern):
+            # regex search across all columns
+            mask = self.df.astype(str).apply(
+                lambda col: col.str.contains(keyword)
+            ).any(axis=1)
+            return mask
+
+        # exact match across all columns
+        mask = (self.df.astype(str) == str(keyword)).any(axis=1)
+        return mask
+
+    def search_pairs(self, first: Keyword, second: Keyword) -> List[Dict[str, int]]:
+        """
+        Find all occurrences where 'first' appears in one row,
+        and 'second' appears in a later row.
+        Optimized for large DataFrames.
+        """
+        first_mask = self._match_vectorized(first)
+        second_mask = self._match_vectorized(second)
+
+        first_indexes = np.flatnonzero(first_mask.values)
+        second_indexes = np.flatnonzero(second_mask.values)
+
+        results = []
+        if len(first_indexes) == 0 or len(second_indexes) == 0:
+            return results
+
+        # Efficient search: for each first, find the earliest second after it
+        j = 0
+        for f in first_indexes:
+            while j < len(second_indexes) and second_indexes[j] <= f:
+                j += 1
+            if j < len(second_indexes):
+                results.append({"first_index": f, "second_index": second_indexes[j]})
+        return results
+
+    def get_row(self, index: int) -> pd.Series:
+        """Return row at given index."""
+        return self.df.loc[index]
+
+    def get_range(self, start: int, end: int) -> pd.DataFrame:
+        """Return rows between start and end (inclusive)."""
+        return self.df.loc[start:end]
+
+    def get_list(self, indexes: List[int]) -> pd.DataFrame:
+        """Return rows from a list of indexes."""
+        return self.df.loc[indexes]
