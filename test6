@@ -1,876 +1,818 @@
-class Searchbox {
-    constructor(options) {
-        // options the user can pass in
-        this.searchboxNode = options.searchbox_node;
-        this.dropdown_close_on_click = options.dropdown_close_on_click || false;
-        this.sortable = options.dropdown_sortable || true;
-        this.multiselectable = options.dropdown_multiselectable || false;
-        this.searchInputCallback = options.search_input_callback || function () { };
-        this.selectedItemsCallback = options.selected_items_callback || function () { };
-        this.searchboxName = options.searchbox_name || '';
-        this.searchboxInfo = options.searchbox_info || '';
-        this.searchboxHideLabel = options.searchbox_hide_label || false;
-        this.searchboxPlaceholder = options.searchbox_placeholder || '';
-        this.searchboxForm = options.searchbox_form || null;
-        
-
-        this.searchbox_element_id = this.searchboxNode.id;
-        this.create_searchbox();
-        this.sortAscBtn = document.getElementById(`${this.searchbox_element_id}-sort-asc-btn`);
-        this.sortDescBtn = document.getElementById(`${this.searchbox_element_id}-sort-desc-btn`);
-        this.dropdownNode = document.getElementById(`${this.searchbox_element_id}-results`);
-        this.addEmptyDropdownItem();
-        this.searchboxInputNode = document.getElementById(`${this.searchbox_element_id}-input`);
-        this.activeDescendant = this.dropdownNode.getAttribute('aria-activedescendant') || null;
-        this.moveUpDownEnabled = false;
-        this.siblingList = null;
-        this.startRangeIndex = 0;
-        this.upButton = null;
-        this.downButton = null;
-        this.moveButton = null;
-        this.keysSoFar = '';
-        this.handleItemChange = function () { };
-        this.handleFocusChange = function () { };
-        this.registerEvents();
-    }
-
-    registerEvents() {
-        this.dropdownNode.addEventListener('focus', this.setupFocus.bind(this));
-        this.dropdownNode.addEventListener('keydown', this.checkKeyPress.bind(this));
-        this.dropdownNode.addEventListener('click', this.checkClickItem.bind(this));
-        
-        this.searchboxNode.addEventListener('input', this.searchInput.bind(this));
-        this.sortAscBtn.addEventListener('click', this.sort_asc.bind(this));
-        this.sortDescBtn.addEventListener('click', this.sort_desc.bind(this));
-        this.searchboxInputNode.addEventListener('focus', this.inputFocus.bind(this));
-
-        if (!this.documentHasEventListener('searchbox-click-outside')) {
-            document.addEventListener('click', this.checkClickOutside.bind(this), {id: 'searchbox-click-outside'});
-        }
-
-        if (this.multiselectable) {
-            this.dropdownNode.addEventListener(
-                'mousedown',
-                this.checkMouseDown.bind(this)
-            );
-        }
-    }
-
-    documentHasEventListener(id) {
-        const eventListeners = document.eventListeners || [];
-        for (let i = 0; i < eventListeners.length; i++) {
-            const eventListener = eventListeners[i];
-            if (eventListener.id === id) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    checkClickOutside(event) {
-        const elements = document.querySelectorAll(`.search-dropdown`);
-        
-        for (const element of elements) {
-            const input = document.getElementById(`${element.getAttribute("for")}`)
-            if (!element.contains(event.target) && event.target != input) {
-                element.style.display = 'none';
-            }
-        }
-    }
-
-    inputFocus() {
-        const dropdown = this.dropdownNode.parentElement;
-        console.log(dropdown);
-        // Show the dropdown
-        dropdown.style.display = 'block';
-    }
-
-    searchInput(user_input) {
-        const dropdown_items = this.searchInputCallback(user_input.target.value);
-        this.deleteItems(true)
-        this.addItems(dropdown_items)
-        
-        const dropdown = this.dropdownNode.parentElement;
-        // Show the dropdown
-        dropdown.style.display = 'block';
-
-        // Position the dropdown below the search box
-        const rect = this.searchboxNode.getBoundingClientRect();
-        dropdown.style.top = `${rect.height+1}px`;
-        const computedStyle = window.getComputedStyle(this.searchboxNode);
-        const paddingLeft = computedStyle.getPropertyValue('padding-left'); 
-        dropdown.style.left = paddingLeft;
-        const paddingRight = computedStyle.getPropertyValue('padding-right');
-        dropdown.style.width = `calc(100% - ${paddingLeft} - ${paddingRight})`;
-    }
-
-    deepSort(data, direction = 'asc', key) {
-        // Helper function to get the value of a nested key
-        const getNestedValue = (obj, key) => {
-            return key.split('.').reduce((acc, part) => acc && acc[part], obj);
-        };
-
-        // Perform a deep copy of the array
-        const copiedData = structuredClone(data);
-
-        // Prepare an array of values for sorting, to avoid recomputing for each comparison
-        const sortedData = copiedData.map(item => {
-            return {
-                item, // store original item
-                value: getNestedValue(item, key) // store the value at the nested key
-            };
-        });
-
-        // Sort based on the cached nested values
-        sortedData.sort((a, b) => {
-            const valueA = a.value;
-            const valueB = b.value;
-
-            if (valueA < valueB) {
-                return direction === 'asc' ? -1 : 1;
-            }
-            if (valueA > valueB) {
-                return direction === 'asc' ? 1 : -1;
-            }
-            return 0;
-        });
-
-        // Return the sorted array using the stored item references
-        return sortedData.map(sortedItem => sortedItem.item);
-    }
-
-
-    sort_asc() {
-        const data = [];
-        Array.from(this.dropdownNode.children).forEach(function (option){
-            data.push({ option: option.outerHTML, sortvalue: option.dataset.sortvalue });
-        });
-        
-        const sortedData = this.deepSort(data, 'asc', 'sortvalue');
-
-        let html = '';
-
-        sortedData.forEach(function (sorted_item){
-            html += sorted_item.option;
-        });
-
-        this.dropdownNode.innerHTML = html;
-        
-    }
-
-    sort_desc() {
-        const data = [];
-        Array.from(this.dropdownNode.children).forEach(function (option){
-            data.push({ option: option.outerHTML, sortvalue: option.dataset.sortvalue });
-        });
-        
-        const sortedData = this.deepSort(data, 'desc', 'sortvalue');
-
-        let html = '';
-
-        sortedData.forEach(function (sorted_item){
-            html += sorted_item.option;
-        });
-
-        this.dropdownNode.innerHTML = html;
-    }
-
-    create_searchbox() {
-        const sorthtml = `
-            <button id="${this.searchbox_element_id}-sort-asc-btn" class="searchbox-sort-btn" type='button' >
-                Sort Ascending
-            </button>
-            <button id="${this.searchbox_element_id}-sort-desc-btn" class="searchbox-sort-btn" type='button' >
-                Sort Descending
-            </button>
-        `
-        const infohtml = `<span class="question-icon" data-bs-toggle="tooltip" data-bs-placement="bottom" title="${this.searchboxInfo}">?</span>`
-        
-        this.searchboxNode.innerHTML = `
-            <label for="${this.searchbox_element_id}-input" class="form-label" ${(this.searchboxHideLabel) ? 'style="visibility: hidden;"': ''}>${this.searchboxName}</label>
-            ${(this.searchboxInfo) ? infohtml : ''}
-            <input type="text" class="form-control" id="${this.searchbox_element_id}-input" placeholder="${this.searchboxPlaceholder}">
-            <div id="${this.searchbox_element_id}-dropdown" class="search-dropdown" for="${this.searchbox_element_id}-input">
-                ${(this.sortable) ? sorthtml : ''}
-                <ul id="${this.searchbox_element_id}-results" tabindex="0" ${(this.multiselectable) ? 'aria-multiselectable="true"' : ''} role="listbox">
-                </ul>
-            </div>
-        `;
-
-    }
-
-    addEmptyDropdownItem() {
-        let li = document.createElement('li');
-        li.setAttribute('role', 'option')
-        li.setAttribute('no-results', 'true')
-        li.classList.add('listbox-item')
-        li.textContent = 'No Results Found';
-        this.dropdownNode.appendChild(li);
-    }
-
-    setupFocus() {
-        if (this.activeDescendant) {
-            const listitem = document.getElementById(this.activeDescendant);
-            listitem.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-        } else {
-            this.focusFirstItem();
-        }
-    }
-
-    focusFirstItem() {
-        var firstItem = this.dropdownNode.querySelector('[role="option"]');
-
-        if (firstItem) {
-            this.focusItem(firstItem);
-        }
-    }
-
-    focusLastItem() {
-        const itemList = this.dropdownNode.querySelectorAll('[role="option"]');
-
-        if (itemList.length) {
-            this.focusItem(itemList[itemList.length - 1]);
-        }
-    }
-
-    checkKeyPress(evt) {
-        const lastActiveId = this.activeDescendant;
-        const allOptions = this.dropdownNode.querySelectorAll('[role="option"]');
-        const currentItem =
-            document.getElementById(this.activeDescendant) || allOptions[0];
-        let nextItem = currentItem;
-
-        if (!currentItem) {
-            return;
-        }
-
-        switch (evt.key) {
-            case 'PageUp':
-            case 'PageDown':
-                evt.preventDefault();
-                if (this.moveUpDownEnabled) {
-                    if (evt.key === 'PageUp') {
-                        this.moveUpItems();
-                    } else {
-                        this.moveDownItems();
-                    }
-                }
-
-                break;
-            case 'ArrowUp':
-            case 'ArrowDown':
-                evt.preventDefault();
-                if (!this.activeDescendant) {
-                    // focus first option if no option was previously focused, and perform no other actions
-                    this.focusItem(currentItem);
-                    break;
-                }
-
-                if (this.moveUpDownEnabled && evt.altKey) {
-                    evt.preventDefault();
-                    if (evt.key === 'ArrowUp') {
-                        this.moveUpItems();
-                    } else {
-                        this.moveDownItems();
-                    }
-                    this.updateScroll();
-                    return;
-                }
-
-                if (evt.key === 'ArrowUp') {
-                    nextItem = this.findPreviousOption(currentItem);
-                } else {
-                    nextItem = this.findNextOption(currentItem);
-                }
-
-                if (nextItem && this.multiselectable && event.shiftKey) {
-                    this.selectRange(this.startRangeIndex, nextItem);
-                }
-
-                if (nextItem) {
-                    this.focusItem(nextItem);
-                }
-
-                break;
-
-            case 'Home':
-                evt.preventDefault();
-                this.focusFirstItem();
-
-                if (this.multiselectable && evt.shiftKey && evt.ctrlKey) {
-                    this.selectRange(this.startRangeIndex, 0);
-                }
-                break;
-
-            case 'End':
-                evt.preventDefault();
-                this.focusLastItem();
-
-                if (this.multiselectable && evt.shiftKey && evt.ctrlKey) {
-                    this.selectRange(this.startRangeIndex, allOptions.length - 1);
-                }
-                break;
-
-            case 'Shift':
-                this.startRangeIndex = this.getElementIndex(currentItem, allOptions);
-                break;
-
-            case ' ':
-                evt.preventDefault();
-                this.toggleSelectItem(nextItem);
-                break;
-
-            case 'Backspace':
-            case 'Delete':
-            case 'Enter':
-                if (!this.moveButton) {
-                    return;
-                }
-
-                var keyshortcuts = this.moveButton.getAttribute('aria-keyshortcuts');
-                if (evt.key === 'Enter' && keyshortcuts.indexOf('Enter') === -1) {
-                    return;
-                }
-                if (
-                    (evt.key === 'Backspace' || evt.key === 'Delete') &&
-                    keyshortcuts.indexOf('Delete') === -1
-                ) {
-                    return;
-                }
-
-                evt.preventDefault();
-
-                var nextUnselected = nextItem.nextElementSibling;
-                while (nextUnselected) {
-                    if (nextUnselected.getAttribute('aria-selected') != 'true') {
-                        break;
-                    }
-                    nextUnselected = nextUnselected.nextElementSibling;
-                }
-                if (!nextUnselected) {
-                    nextUnselected = nextItem.previousElementSibling;
-                    while (nextUnselected) {
-                        if (nextUnselected.getAttribute('aria-selected') != 'true') {
-                            break;
-                        }
-                        nextUnselected = nextUnselected.previousElementSibling;
-                    }
-                }
-
-                this.moveItems();
-
-                if (!this.activeDescendant && nextUnselected) {
-                    this.focusItem(nextUnselected);
-                }
-                break;
-
-            case 'A':
-            case 'a':
-                // handle control + A
-                if (evt.ctrlKey || evt.metaKey) {
-                    if (this.multiselectable) {
-                        this.selectRange(0, allOptions.length - 1);
-                    }
-                    evt.preventDefault();
-                    break;
-                }
-            // fall through
-            default:
-                if (evt.key.length === 1) {
-                    const itemToFocus = this.findItemToFocus(evt.key.toLowerCase());
-                    if (itemToFocus) {
-                        this.focusItem(itemToFocus);
-                    }
-                }
-                break;
-        }
-
-        if (this.activeDescendant !== lastActiveId) {
-            this.updateScroll();
-        }
-    }
-
-    findItemToFocus(character) {
-        const itemList = this.dropdownNode.querySelectorAll('[role="option"]');
-        let searchIndex = 0;
-
-        if (!this.keysSoFar) {
-            for (let i = 0; i < itemList.length; i++) {
-                if (itemList[i].getAttribute('id') == this.activeDescendant) {
-                    searchIndex = i;
-                }
-            }
-        }
-
-        this.keysSoFar += character;
-        this.clearKeysSoFarAfterDelay();
-
-        let nextMatch = this.findMatchInRange(
-            itemList,
-            searchIndex + 1,
-            itemList.length
-        );
-
-        if (!nextMatch) {
-            nextMatch = this.findMatchInRange(itemList, 0, searchIndex);
-        }
-        return nextMatch;
-    }
-
-    /* Return the index of the passed element within the passed array, or null if not found */
-    getElementIndex(option, options) {
-        const allOptions = Array.prototype.slice.call(options); // convert to array
-        const optionIndex = allOptions.indexOf(option);
-
-        return typeof optionIndex === 'number' ? optionIndex : null;
-    }
-
-    /* Return the next listbox option, if it exists; otherwise, returns null */
-    findNextOption(currentOption) {
-        const allOptions = Array.prototype.slice.call(
-            this.dropdownNode.querySelectorAll('[role="option"]')
-        ); // get options array
-        const currentOptionIndex = allOptions.indexOf(currentOption);
-        let nextOption = null;
-
-        if (currentOptionIndex > -1 && currentOptionIndex < allOptions.length - 1) {
-            nextOption = allOptions[currentOptionIndex + 1];
-        }
-
-        return nextOption;
-    }
-
-    /* Return the previous listbox option, if it exists; otherwise, returns null */
-    findPreviousOption(currentOption) {
-        const allOptions = Array.prototype.slice.call(
-            this.dropdownNode.querySelectorAll('[role="option"]')
-        ); // get options array
-        const currentOptionIndex = allOptions.indexOf(currentOption);
-        let previousOption = null;
-
-        if (currentOptionIndex > -1 && currentOptionIndex > 0) {
-            previousOption = allOptions[currentOptionIndex - 1];
-        }
-
-        return previousOption;
-    }
-
-    clearKeysSoFarAfterDelay() {
-        if (this.keyClear) {
-            clearTimeout(this.keyClear);
-            this.keyClear = null;
-        }
-        this.keyClear = setTimeout(
-            function () {
-                this.keysSoFar = '';
-                this.keyClear = null;
-            }.bind(this),
-            500
-        );
-    }
-
-    findMatchInRange(list, startIndex, endIndex) {
-        // Find the first item starting with the keysSoFar substring, searching in
-        // the specified range of items
-        for (let n = startIndex; n < endIndex; n++) {
-            const label = list[n].innerText;
-            if (label && label.toLowerCase().indexOf(this.keysSoFar) === 0) {
-                return list[n];
-            }
-        }
-        return null;
-    }
-
-    checkClickItem(evt) {
-        if (evt.target.getAttribute('role') !== 'option') {
-            return;
-        }
-
-        this.focusItem(evt.target);
-        this.toggleSelectItem(evt.target);
-        this.updateScroll();
-
-        if (this.multiselectable && evt.shiftKey) {
-            this.selectRange(this.startRangeIndex, evt.target);
-        }
-    }
-
-    /**
-     * Prevent text selection on shift + click for multi-select listboxes
-     *
-     * @param evt
-     */
-    checkMouseDown(evt) {
-        if (
-            this.multiselectable &&
-            evt.shiftKey &&
-            evt.target.getAttribute('role') === 'option'
-        ) {
-            evt.preventDefault();
-        }
-    }
-
-    /**
-     * @description
-     *  Toggle the aria-selected value
-     * @param element
-     *  The element to select
-     */
-    toggleSelectItem(element) {
-        if (this.multiselectable) {
-            element.setAttribute(
-                'aria-selected',
-                element.getAttribute('aria-selected') === 'true' ? 'false' : 'true'
-            );
-
-            this.updateMoveButton();
-        }
-    }
-
-    /**
-     * @description
-     *  Defocus the specified item
-     * @param element
-     *  The element to defocus
-     */
-    defocusItem(element) {
-        if (!element) {
-            return;
-        }
-        if (!this.multiselectable) {
-            element.removeAttribute('aria-selected');
-        }
-        element.classList.remove('focused');
-    }
-
-    /**
-     * @description
-     *  Focus on the specified item
-     * @param element
-     *  The element to focus
-     */
-    focusItem(element) {
-        const notSetFocus = this.dropdownNode.querySelectorAll('[aria-selected="true"]').length;
-
-        this.defocusItem(document.getElementById(this.activeDescendant));
-
-        if (!this.multiselectable) {
-            element.setAttribute('aria-selected', 'true');
-        }
-        element.classList.add('focused');
-        this.dropdownNode.setAttribute('aria-activedescendant', element.id);
-        this.activeDescendant = element.id;
-
-        if (!this.multiselectable) {
-            this.updateMoveButton();
-        }
-
-        this.checkUpDownButtons();
-        this.handleFocusChange(element);
-
-
-        const customEvent = new CustomEvent('Listbox:selected_items', {
-            bubbles: true,
-            detail: {
-                message: 'listbox selected items',
-                data: {
-                    focused_items: this.dropdownNode.querySelectorAll(
-                        '.focused'
-                    ),
-                    focused_item: element
-                }
-            }
-        });
-
-        if (!notSetFocus & !element.hasAttribute('no-results')) {
-            this.dropdownNode.dispatchEvent(customEvent);
-            this.selectedItemsCallback(this.dropdownNode.querySelectorAll(
-                '.focused'
-            ));
-        }
-
-        if (!notSetFocus && !this.multiselectable && this.dropdown_close_on_click){
-            this.dropdownNode.parentElement.style.display = 'none';
-        }
+"""
+Fuzzy DataFrame Search CLI Tool
+A high-performance fuzzy search tool for tabular data files.
+"""
+
+__version__ = "1.2.0"
+
+import sys
+from pathlib import Path
+from typing import List, Optional, Tuple, Dict, Any
+import re
+import click
+from rapidfuzz import fuzz, process
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
+from rich.panel import Panel
+from rich import box
+from rich.prompt import Prompt
+
+try:
+    import polars as pl
+    USE_POLARS = True
+except ImportError:
+    console.print("[red]Error: Polars is required for this tool[/red]")
+    console.print("[yellow]Install with: pip install polars pyarrow openpyxl[/yellow]")
+    sys.exit(1)
+
+try:
+    import pyarrow
+    HAS_PYARROW = True
+except ImportError:
+    console.print("[yellow]⚠ PyArrow not found - some features may not work. Install with: pip install pyarrow[/yellow]")
+    HAS_PYARROW = False
+
+console = Console()
+
+
+def auto_detect_file() -> str:
+    """Auto-detect a data file in the current directory."""
+    extensions = ['.csv', '.json', '.xlsx', '.xls', '.parquet']
+    current_dir = Path('.')
     
-    }
+    data_files = []
+    for ext in extensions:
+        data_files.extend(list(current_dir.glob(f'*{ext}')))
+    
+    # Sort for consistent ordering
+    data_files = sorted(data_files, key=lambda x: x.name.lower())
+    
+    if not data_files:
+        console.print("[red]Error: No data files found in current directory[/red]")
+        console.print("[yellow]Supported formats: CSV, JSON, Excel (.xlsx/.xls), Parquet[/yellow]")
+        console.print("[dim]Hint: Use --file to specify a file path[/dim]")
+        sys.exit(1)
+    
+    if len(data_files) == 1:
+        console.print(f"[dim]Auto-detected: {data_files[0].name}[/dim]")
+        return str(data_files[0])
+    
+    # Multiple files found - show menu
+    console.print("[yellow]Multiple data files found:[/yellow]")
+    for i, f in enumerate(data_files, 1):
+        file_size = f.stat().st_size / 1024  # KB
+        size_str = f"{file_size:.1f}KB" if file_size < 1024 else f"{file_size/1024:.1f}MB"
+        console.print(f"  {i}. {f.name} ({size_str})")
+    
+    try:
+        choice = click.prompt("Select file number", type=int, default=1)
+        if 1 <= choice <= len(data_files):
+            return str(data_files[choice - 1])
+        else:
+            console.print("[red]Invalid selection[/red]")
+            sys.exit(1)
+    except (KeyboardInterrupt, EOFError):
+        console.print("\n[yellow]Cancelled[/yellow]")
+        sys.exit(0)
+    except click.Abort:
+        console.print("\n[yellow]Cancelled[/yellow]")
+        sys.exit(0)
 
-    /**
-     * Helper function to check if a number is within a range; no side effects.
-     *
-     * @param index
-     * @param start
-     * @param end
-     * @returns {boolean}
-     */
-    checkInRange(index, start, end) {
-        const rangeStart = start < end ? start : end;
-        const rangeEnd = start < end ? end : start;
 
-        return index >= rangeStart && index <= rangeEnd;
-    }
+def load_dataframe(file_path: str) -> pl.DataFrame:
+    """Load dataframe from various file formats using Polars."""
+    path = Path(file_path)
+    
+    if not path.exists():
+        console.print(f"[red]Error: File '{file_path}' not found[/red]")
+        sys.exit(1)
+    
+    suffix = path.suffix.lower()
+    
+    try:
+        if suffix == '.csv':
+            df = pl.read_csv(file_path, ignore_errors=True)
+        elif suffix == '.json':
+            df = pl.read_json(file_path)
+        elif suffix in ['.xlsx', '.xls']:
+            if not HAS_PYARROW:
+                console.print("[red]Error: PyArrow is required for Excel files[/red]")
+                console.print("[yellow]Install with: pip install pyarrow openpyxl[/yellow]")
+                sys.exit(1)
+            df = pl.read_excel(file_path)
+        elif suffix == '.parquet':
+            df = pl.read_parquet(file_path)
+        else:
+            console.print(f"[red]Unsupported file format: {suffix}[/red]")
+            console.print("[yellow]Supported: .csv, .json, .xlsx, .xls, .parquet[/yellow]")
+            sys.exit(1)
+        
+        return df
+    except FileNotFoundError:
+        console.print(f"[red]Error: File '{file_path}' not found[/red]")
+        sys.exit(1)
+    except PermissionError:
+        console.print(f"[red]Error: Permission denied accessing '{file_path}'[/red]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]Error loading file: {e}[/red]")
+        console.print(f"[dim]File: {file_path}[/dim]")
+        sys.exit(1)
 
-    /**
-     * Select a range of options
-     *
-     * @param start
-     * @param end
-     */
-    selectRange(start, end) {
-        // get start/end indices
-        const allOptions = this.dropdownNode.querySelectorAll('[role="option"]');
-        const startIndex =
-            typeof start === 'number'
-                ? start
-                : this.getElementIndex(start, allOptions);
-        const endIndex =
-            typeof end === 'number' ? end : this.getElementIndex(end, allOptions);
 
-        for (let index = 0; index < allOptions.length; index++) {
-            const selected = this.checkInRange(index, startIndex, endIndex);
-            allOptions[index].setAttribute('aria-selected', selected + '');
-        }
+def validate_columns(df: pl.DataFrame, columns: List[str]) -> List[str]:
+    """Validate that specified columns exist in dataframe."""
+    available_cols = list(df.columns)
+    invalid_cols = [col for col in columns if col not in available_cols]
+    
+    if invalid_cols:
+        console.print(f"[red]Error: Column(s) not found: {', '.join(invalid_cols)}[/red]")
+        console.print(f"[yellow]Available columns:[/yellow]")
+        for col in available_cols[:10]:  # Show first 10
+            console.print(f"  • {col}")
+        if len(available_cols) > 10:
+            console.print(f"  ... and {len(available_cols) - 10} more")
+        sys.exit(1)
+    
+    return columns
 
-        this.updateMoveButton();
-    }
 
-    /**
-     * Check for selected options and update moveButton, if applicable
-     */
-    updateMoveButton() {
-        if (!this.moveButton) {
-            return;
-        }
+def search_nulls_blanks(
+    df: pl.DataFrame,
+    columns: Optional[List[str]] = None,
+    search_type: str = "null"  # "null" or "blank"
+) -> pl.DataFrame:
+    """Search for null or blank values in specified columns."""
+    search_columns = columns if columns else list(df.columns)
+    
+    if columns:
+        search_columns = validate_columns(df, columns)
+    
+    # Build filter condition
+    conditions = []
+    for col in search_columns:
+        if search_type == "null":
+            conditions.append(pl.col(col).is_null())
+        elif search_type == "blank":
+            # Check for null OR empty string OR whitespace-only
+            conditions.append(
+                pl.col(col).is_null() | 
+                (pl.col(col).cast(pl.Utf8).str.strip_chars() == "")
+            )
+    
+    # Combine conditions with OR
+    if conditions:
+        filter_condition = conditions[0]
+        for cond in conditions[1:]:
+            filter_condition = filter_condition | cond
+        
+        return df.filter(filter_condition)
+    
+    return df.head(0)  # Return empty dataframe
 
-        if (this.dropdownNode.querySelector('[aria-selected="true"]')) {
-            this.moveButton.setAttribute('aria-disabled', 'false');
-        } else {
-            this.moveButton.setAttribute('aria-disabled', 'true');
-        }
-    }
 
-    /**
-     * Check if the selected option is in view, and scroll if not
-     */
-    updateScroll() {
-        const selectedOption = document.getElementById(this.activeDescendant);
-        if (selectedOption) {
-            const scrollBottom =
-                this.dropdownNode.clientHeight + this.dropdownNode.scrollTop;
-            const elementBottom =
-                selectedOption.offsetTop + selectedOption.offsetHeight;
-            if (elementBottom > scrollBottom) {
-                this.dropdownNode.scrollTop =
-                    elementBottom - this.dropdownNode.clientHeight;
-            } else if (selectedOption.offsetTop < this.dropdownNode.scrollTop) {
-                this.dropdownNode.scrollTop = selectedOption.offsetTop;
-            }
-            selectedOption.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-        }
-    }
+def regex_search_dataframe(
+    df: pl.DataFrame,
+    pattern: str,
+    columns: Optional[List[str]] = None,
+    case_sensitive: bool = False,
+    limit: int = 20
+) -> List[Tuple[int, int, str, str]]:
+    """
+    Perform regex search across dataframe columns.
+    Returns list of (row_index, score, matching_column, match_text) tuples.
+    Score is always 100 for regex matches (either matches or doesn't).
+    """
+    if columns:
+        search_columns = columns
+    else:
+        search_columns = list(df.columns)
+    
+    # Validate columns exist
+    if columns:
+        search_columns = validate_columns(df, columns)
+    
+    # Compile regex pattern
+    try:
+        flags = 0 if case_sensitive else re.IGNORECASE
+        regex = re.compile(pattern, flags)
+    except re.error as e:
+        console.print(f"[red]Invalid regex pattern: {e}[/red]")
+        sys.exit(1)
+    
+    results = []
+    
+    for col in search_columns:
+        try:
+            # Convert column to string list
+            col_data = df[col].fill_null("").cast(pl.Utf8).to_list()
+            
+            # Skip empty columns
+            if not any(col_data):
+                continue
+            
+            # Search for regex matches
+            for idx, value in enumerate(col_data):
+                if regex.search(str(value)):
+                    results.append((idx, 100, col, str(value)))
+                    
+                    # Stop if we've hit the limit
+                    if len(results) >= limit:
+                        return results
+        
+        except Exception as e:
+            console.print(f"[yellow]Warning: Could not search column '{col}': {e}[/yellow]")
+            continue
+    
+    return results[:limit]
 
-    /**
-     * @description
-     *  Enable/disable the up/down arrows based on the activeDescendant.
-     */
-    checkUpDownButtons() {
-        const activeElement = document.getElementById(this.activeDescendant);
 
-        if (!this.moveUpDownEnabled) {
-            return;
-        }
+def fuzzy_search_dataframe(
+    df: pl.DataFrame,
+    query: str,
+    columns: Optional[List[str]] = None,
+    threshold: int = 70,
+    limit: int = 20,
+    case_sensitive: bool = False
+) -> List[Tuple[int, int, str, str]]:
+    """
+    Perform fuzzy search across dataframe columns.
+    Returns list of (row_index, score, matching_column, match_text) tuples.
+    """
+    if columns:
+        search_columns = columns
+    else:
+        search_columns = list(df.columns)
+    
+    # Validate columns exist
+    if columns:
+        search_columns = validate_columns(df, columns)
+    
+    results = []
+    
+    for col in search_columns:
+        try:
+            # Convert column to string list, handling various data types
+            col_data = df[col].fill_null("").cast(pl.Utf8).to_list()
+            
+            # Skip empty columns
+            if not any(col_data):
+                continue
+            
+            # For case-insensitive search, convert both query and data to lowercase
+            if case_sensitive:
+                search_query = query
+                search_data = col_data
+            else:
+                search_query = query.lower()
+                search_data = [s.lower() for s in col_data]
+            
+            # Perform fuzzy matching
+            matches = process.extract(
+                search_query,
+                search_data,
+                scorer=fuzz.WRatio,
+                limit=None,
+                score_cutoff=threshold
+            )
+            
+            for match_text, score, idx in matches:
+                # Return the original text, not the lowercased version
+                original_text = col_data[idx]
+                results.append((idx, score, col, original_text))
+        
+        except Exception as e:
+            console.print(f"[yellow]Warning: Could not search column '{col}': {e}[/yellow]")
+            continue
+    
+    # Sort by score (descending) and take top results
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results[:limit]
 
-        if (!activeElement) {
-            this.upButton.setAttribute('aria-disabled', 'true');
-            this.downButton.setAttribute('aria-disabled', 'true');
-            return;
-        }
 
-        if (this.upButton) {
-            if (activeElement.previousElementSibling) {
-                this.upButton.setAttribute('aria-disabled', false);
-            } else {
-                this.upButton.setAttribute('aria-disabled', 'true');
-            }
-        }
+def highlight_match(text: str, query: str, is_regex: bool = False, case_sensitive: bool = False) -> Text:
+    """Highlight matching portions of text."""
+    text_str = str(text)
+    
+    if is_regex:
+        # For regex, highlight all matches
+        rich_text = Text()
+        try:
+            flags = 0 if case_sensitive else re.IGNORECASE
+            pattern = re.compile(query, flags)
+            last_end = 0
+            
+            for match in pattern.finditer(text_str):
+                start, end = match.span()
+                # Add text before match
+                rich_text.append(text_str[last_end:start])
+                # Add highlighted match
+                rich_text.append(text_str[start:end], style="bold yellow on blue")
+                last_end = end
+            
+            # Add remaining text
+            rich_text.append(text_str[last_end:])
+            
+            # If no matches were highlighted, just return the text
+            if last_end == 0:
+                return Text(text_str, style="cyan")
+            
+            return rich_text
+        except:
+            return Text(text_str, style="cyan")
+    else:
+        # Original fuzzy highlighting logic
+        text_lower = text_str.lower()
+        query_lower = query.lower()
+        
+        rich_text = Text()
+        
+        if query_lower in text_lower:
+            start = text_lower.index(query_lower)
+            end = start + len(query)
+            
+            rich_text.append(text_str[:start])
+            rich_text.append(text_str[start:end], style="bold yellow on blue")
+            rich_text.append(text_str[end:])
+        else:
+            rich_text.append(text_str, style="cyan")
+        
+        return rich_text
 
-        if (this.downButton) {
-            if (activeElement.nextElementSibling) {
-                this.downButton.setAttribute('aria-disabled', false);
-            } else {
-                this.downButton.setAttribute('aria-disabled', 'true');
-            }
-        }
-    }
 
-    /**
-     * @description
-     *  Add the specified items to the listbox. Assumes items are valid options.
-     * @param items
-     *  An array of items to add to the listbox
-     */
-    addItems(items) {
-        if (!items || !items.length) {
-            return;
-        }
+def paginate_results(
+    df: pl.DataFrame,
+    results: List[Tuple[int, int, str, str]],
+    query: str,
+    show_columns: Optional[List[str]] = None,
+    page_size: int = 20,
+    is_regex: bool = False,
+    case_sensitive: bool = False
+):
+    """Display results with pagination support."""
+    
+    if not results:
+        console.print(Panel(
+            "[yellow]No matches found[/yellow]\n"
+            "[dim]Try lowering the threshold with -t flag (e.g., -t 60)[/dim]",
+            title="Search Results",
+            border_style="yellow"
+        ))
+        return
+    
+    # Get unique results
+    seen_indices = set()
+    unique_results = []
+    for result in results:
+        idx = result[0]
+        if idx not in seen_indices:
+            seen_indices.add(idx)
+            unique_results.append(result)
+    
+    total_results = len(unique_results)
+    total_pages = (total_results + page_size - 1) // page_size
+    current_page = 0
+    
+    all_columns = list(df.columns)
+    if show_columns:
+        display_cols = validate_columns(df, show_columns)
+    else:
+        display_cols = all_columns[:min(5, len(all_columns))]
+    
+    while True:
+        # Calculate page boundaries
+        start_idx = current_page * page_size
+        end_idx = min(start_idx + page_size, total_results)
+        page_results = unique_results[start_idx:end_idx]
+        
+        # Create table for current page
+        table = Table(
+            title=f"🔍 Search Results for: '{query}' (Page {current_page + 1}/{total_pages})",
+            box=box.ROUNDED,
+            show_header=True,
+            header_style="bold magenta",
+            border_style="bright_blue",
+            show_lines=False
+        )
+        
+        table.add_column("#", style="dim", justify="right", width=4)
+        table.add_column("Score", style="green", justify="right", width=6)
+        table.add_column("Match Column", style="cyan", width=20, no_wrap=True)
+        
+        for col in display_cols:
+            table.add_column(col, style="white", max_width=40, overflow="fold")
+        
+        # Add rows for current page
+        for result_idx, (idx, score, match_col, match_text) in enumerate(page_results, start=start_idx + 1):
+            try:
+                row = df[idx]
+                row_data = {col: str(row[col][0]) if row[col][0] is not None else "" for col in all_columns}
+                
+                row_values = [
+                    str(result_idx),
+                    f"{score}%",
+                    match_col[:18] + "..." if len(match_col) > 18 else match_col
+                ]
+                
+                for col in display_cols:
+                    value = row_data.get(col, "")
+                    if col == match_col:
+                        row_values.append(highlight_match(value, query, is_regex, case_sensitive))
+                    else:
+                        truncated = value[:200] if len(value) > 200 else value
+                        row_values.append(truncated)
+                
+                table.add_row(*row_values)
+            
+            except Exception as e:
+                console.print(f"[dim]Warning: Could not display row {idx}: {e}[/dim]")
+                continue
+        
+        console.clear()
+        console.print(table)
+        console.print(f"\n[dim]Showing results {start_idx + 1}-{end_idx} of {total_results} total matches[/dim]")
+        
+        if not show_columns and len(all_columns) > 5:
+            console.print(f"[dim]Hint: Use --show to display specific columns (showing {len(display_cols)} of {len(all_columns)} columns)[/dim]")
+        
+        # Pagination controls
+        if total_pages > 1:
+            console.print("\n[bold cyan]Navigation:[/bold cyan] [n]ext | [p]revious | [g]oto page | [q]uit")
+            choice = Prompt.ask("", default="n").lower()
+            
+            if choice == 'q':
+                break
+            elif choice == 'n':
+                if current_page < total_pages - 1:
+                    current_page += 1
+                else:
+                    console.print("[yellow]Already at last page[/yellow]")
+                    continue
+            elif choice == 'p':
+                if current_page > 0:
+                    current_page -= 1
+                else:
+                    console.print("[yellow]Already at first page[/yellow]")
+                    continue
+            elif choice == 'g':
+                try:
+                    page_num = int(Prompt.ask("Enter page number", default="1"))
+                    if 1 <= page_num <= total_pages:
+                        current_page = page_num - 1
+                    else:
+                        console.print(f"[yellow]Invalid page. Enter 1-{total_pages}[/yellow]")
+                        continue
+                except ValueError:
+                    console.print("[yellow]Invalid page number[/yellow]")
+                    continue
+            else:
+                # Treat any other input as 'next'
+                if current_page < total_pages - 1:
+                    current_page += 1
+                else:
+                    break
+        else:
+            break
 
-        this.clearActiveDescendant();
 
-        items.forEach(
-            function (item) {
-                this.defocusItem(item);
-                this.dropdownNode.append(item);
-            }.bind(this)
-        );
+def export_results(
+    df: pl.DataFrame,
+    results: List[Tuple[int, int, str, str]],
+    output_path: str,
+    show_columns: Optional[List[str]] = None
+):
+    """Export search results to a file."""
+    # Get unique row indices
+    seen_indices = set()
+    unique_indices = []
+    for idx, score, match_col, match_text in results:
+        if idx not in seen_indices:
+            seen_indices.add(idx)
+            unique_indices.append(idx)
+    
+    # Filter dataframe to matching rows
+    result_df = df[unique_indices]
+    
+    # Filter columns if specified
+    if show_columns:
+        show_columns = validate_columns(df, show_columns)
+        result_df = result_df.select(show_columns)
+    
+    # Determine output format from file extension
+    output_path_obj = Path(output_path)
+    suffix = output_path_obj.suffix.lower()
+    
+    try:
+        if suffix == '.csv':
+            result_df.write_csv(output_path)
+        elif suffix == '.json':
+            result_df.write_json(output_path)
+        elif suffix in ['.xlsx', '.xls']:
+            if not HAS_PYARROW:
+                console.print("[red]Error: PyArrow required for Excel export[/red]")
+                console.print("[yellow]Install with: pip install pyarrow openpyxl[/yellow]")
+                sys.exit(1)
+            result_df.write_excel(output_path)
+        elif suffix == '.parquet':
+            result_df.write_parquet(output_path)
+        else:
+            console.print(f"[red]Unsupported output format: {suffix}[/red]")
+            console.print("[yellow]Supported: .csv, .json, .xlsx, .parquet[/yellow]")
+            sys.exit(1)
+        
+        console.print(f"\n[green]✓[/green] Exported {len(result_df)} rows to {output_path}")
+    
+    except Exception as e:
+        console.print(f"[red]Error exporting results: {e}[/red]")
+        sys.exit(1)
 
-        // if (!this.activeDescendant) {
-        //     this.focusItem(items[0]);
-        // }
 
-        this.handleItemChange('added', items);
-    }
+def display_results(
+    df: pl.DataFrame,
+    results: List[Tuple[int, int, str, str]],
+    query: str,
+    show_columns: Optional[List[str]] = None,
+    is_regex: bool = False,
+    case_sensitive: bool = False
+):
+    """Display search results in a beautiful table (non-paginated version)."""
+    
+    if not results:
+        console.print(Panel(
+            "[yellow]No matches found[/yellow]\n"
+            "[dim]Try lowering the threshold with -t flag (e.g., -t 60)[/dim]",
+            title="Search Results",
+            border_style="yellow"
+        ))
+        return
+    
+    # Create results table
+    table = Table(
+        title=f"🔍 Search Results for: '{query}'",
+        box=box.ROUNDED,
+        show_header=True,
+        header_style="bold magenta",
+        border_style="bright_blue",
+        show_lines=False
+    )
+    
+    table.add_column("Score", style="green", justify="right", width=6)
+    table.add_column("Match Column", style="cyan", width=20, no_wrap=True)
+    
+    # Determine which columns to display
+    all_columns = list(df.columns)
+    
+    if show_columns:
+        # Validate show columns exist
+        display_cols = validate_columns(df, show_columns)
+    else:
+        # Default to first 5 columns or all if fewer
+        display_cols = all_columns[:min(5, len(all_columns))]
+    
+    for col in display_cols:
+        table.add_column(col, style="white", max_width=40, overflow="fold")
+    
+    # Add rows
+    seen_indices = set()
+    for idx, score, match_col, match_text in results:
+        if idx in seen_indices:
+            continue
+        seen_indices.add(idx)
+        
+        try:
+            # Get row data using Polars
+            row = df[idx]
+            row_data = {col: str(row[col][0]) if row[col][0] is not None else "" for col in all_columns}
+            
+            # Build table row
+            row_values = [
+                f"{score}%",
+                match_col[:18] + "..." if len(match_col) > 18 else match_col
+            ]
+            
+            for col in display_cols:
+                value = row_data.get(col, "")
+                if col == match_col:
+                    row_values.append(highlight_match(value, query, is_regex, case_sensitive))
+                else:
+                    # Truncate long values
+                    truncated = value[:200] if len(value) > 200 else value
+                    row_values.append(truncated)
+            
+            table.add_row(*row_values)
+        
+        except Exception as e:
+            console.print(f"[dim]Warning: Could not display row {idx}: {e}[/dim]")
+            continue
+    
+    console.print(table)
+    console.print(f"\n[dim]Showing {len(seen_indices)} unique result(s) out of {len(df)} total rows[/dim]")
+    
+    # Show hint if display columns are limited
+    if not show_columns and len(all_columns) > 5:
+        console.print(f"[dim]Hint: Use --show to display specific columns (showing {len(display_cols)} of {len(all_columns)} columns)[/dim]")
 
-    /**
-     * @description
-     *  Remove all of the selected items from the listbox; Removes the focused items
-     *  in a single select listbox and the items with aria-selected in a multi
-     *  select listbox.
-     * @returns {Array}
-     *  An array of items that were removed from the listbox
-     */
-    deleteItems(delete_all = false) {
-        let itemsToDelete;
 
-        if (delete_all) {
-            itemsToDelete = this.dropdownNode.querySelectorAll('.listbox-item');
-        } else if (this.multiselectable) {
-            itemsToDelete = this.dropdownNode.querySelectorAll(
-                '[aria-selected="true"]'
-            );
-        } else if (this.activeDescendant) {
-            itemsToDelete = [document.getElementById(this.activeDescendant)];
-        }
+@click.command()
+@click.argument('query', required=False)
+@click.argument('columns', nargs=-1)
+@click.option('--file', '-f', default=None, help='Data file path (auto-detected if not specified)')
+@click.option('--threshold', '-t', default=70, type=click.IntRange(0, 100), help='Minimum match score (0-100)')
+@click.option('--limit', '-l', default=20, type=click.IntRange(1, 10000), help='Maximum number of results')
+@click.option('--show', '-s', multiple=True, help='Columns to display in results')
+@click.option('--output', '-o', default=None, help='Export results to file (.csv, .json, .xlsx, .parquet)')
+@click.option('--page', '-p', is_flag=True, help='Enable pagination for results')
+@click.option('--page-size', default=20, type=click.IntRange(1, 100), help='Results per page (default: 20)')
+@click.option('--null', 'search_null', is_flag=True, help='Search for null values in specified columns')
+@click.option('--blank', 'search_blank', is_flag=True, help='Search for blank/empty values in specified columns')
+@click.option('--case-sensitive', '-c', is_flag=True, help='Enable case-sensitive search (default: case-insensitive)')
+@click.option('--regex', '-r', is_flag=True, help='Enable regex search mode')
+@click.version_option(version=__version__)
+def main(
+    query: Optional[str],
+    columns: tuple,
+    file: Optional[str],
+    threshold: int,
+    limit: int,
+    show: tuple,
+    output: Optional[str],
+    page: bool,
+    page_size: int,
+    search_null: bool,
+    search_blank: bool,
+    case_sensitive: bool,
+    regex: bool
+):
+    """
+    Fuzzy search through dataframes with beautiful terminal output.
+    
+    Usage: 
+        fuzz "search query" [column1 column2 ...]
+        fuzz "john smith" name email
+        fuzz "acme" company --show name phone
+        fuzz --null email phone              # Find null values
+        fuzz --blank company                  # Find blank values
+        fuzz "search" -o results.csv         # Export results
+        fuzz "search" --page                  # Paginate results
+        fuzz "John" --case-sensitive         # Case-sensitive search
+        fuzz "^[A-Z]{3}$" --regex            # Regex search
+        fuzz "\\d{3}-\\d{3}-\\d{4}" phone -r # Phone pattern
+    
+    By default, searches are case-insensitive fuzzy matching. 
+    Use --case-sensitive for exact case, --regex for pattern matching.
+    Auto-detects data files in current directory if --file not specified.
+    Supports CSV, JSON, Excel, and Parquet files.
+    """
+    
+    # Auto-detect file if not provided
+    if file is None:
+        file_path = auto_detect_file()
+    else:
+        file_path = file
+    
+    # Display header
+    console.print(Panel.fit(
+        "[bold blue]Fuzzy DataFrame Search[/bold blue]\n"
+        f"[dim]File: {file_path}[/dim]",
+        border_style="blue"
+    ))
+    
+    # Load data
+    try:
+        with console.status("[bold green]Loading data..."):
+            df = load_dataframe(file_path)
+        
+        row_count = len(df)
+        col_count = len(df.columns)
+        
+        if row_count == 0:
+            console.print("[yellow]Warning: File contains no data rows[/yellow]")
+            sys.exit(1)
+        
+        console.print(f"[green]✓[/green] Loaded {row_count:,} rows, {col_count} columns")
+        console.print("[dim]✓ Using Polars (high-performance mode)[/dim]")
+    
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Cancelled[/yellow]")
+        sys.exit(0)
+    
+    # Handle null/blank search
+    if search_null or search_blank:
+        search_type = "blank" if search_blank else "null"
+        search_label = "blank/empty" if search_blank else "null"
+        
+        search_columns = list(columns) if columns else None
+        
+        with console.status(f"[bold green]Searching for {search_label} values..."):
+            result_df = search_nulls_blanks(df, search_columns, search_type)
+        
+        if len(result_df) == 0:
+            console.print(f"\n[green]✓[/green] No {search_label} values found!")
+        else:
+            console.print(f"\n[yellow]Found {len(result_df)} rows with {search_label} values[/yellow]")
+            
+            # Display sample results
+            display_cols = list(show) if show else list(df.columns)[:5]
+            display_cols = validate_columns(df, display_cols) if show else display_cols
+            
+            table = Table(title=f"Rows with {search_label.title()} Values", box=box.ROUNDED)
+            for col in display_cols:
+                table.add_column(col, style="white", max_width=40, overflow="fold")
+            
+            # Show first 20 results
+            for i in range(min(20, len(result_df))):
+                row = result_df[i]
+                row_values = [str(row[col][0]) if row[col][0] is not None else "[red]NULL[/red]" for col in display_cols]
+                table.add_row(*row_values)
+            
+            console.print(table)
+            
+            if len(result_df) > 20:
+                console.print(f"\n[dim]Showing first 20 of {len(result_df)} results[/dim]")
+            
+            # Export if requested
+            if output:
+                # Create fake results list for export function
+                results = [(i, 100, "", "") for i in range(len(result_df))]
+                export_results(result_df, results, output, list(show) if show else None)
+        
+        return
+    
+    # Validate query is not empty for regular search
+    if not query or not query.strip():
+        console.print("[red]Error: Search query cannot be empty[/red]")
+        console.print("[dim]Use --null or --blank to search for missing values[/dim]")
+        sys.exit(1)
+    
+    # Perform search (regex or fuzzy)
+    search_columns = list(columns) if columns else None
+    
+    try:
+        # Display search mode
+        if regex:
+            search_mode = f"regex ({'case-sensitive' if case_sensitive else 'case-insensitive'})"
+        else:
+            search_mode = "case-sensitive" if case_sensitive else "case-insensitive"
+        console.print(f"[dim]Search mode: {search_mode}[/dim]")
+        
+        with console.status(f"[bold green]Searching for '{query}'..."):
+            if regex:
+                results = regex_search_dataframe(
+                    df,
+                    query,
+                    columns=search_columns,
+                    case_sensitive=case_sensitive,
+                    limit=limit
+                )
+            else:
+                results = fuzzy_search_dataframe(
+                    df,
+                    query,
+                    columns=search_columns,
+                    threshold=threshold,
+                    limit=limit,
+                    case_sensitive=case_sensitive
+                )
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Search cancelled[/yellow]")
+        sys.exit(0)
+    except Exception as e:
+        console.print(f"[red]Error during search: {e}[/red]")
+        sys.exit(1)
+    
+    # Export results if requested
+    if output:
+        export_results(df, results, output, list(show) if show else None)
+    
+    # Display results with or without pagination
+    try:
+        if page:
+            paginate_results(
+                df,
+                results,
+                query,
+                show_columns=list(show) if show else None,
+                page_size=page_size,
+                is_regex=regex,
+                case_sensitive=case_sensitive
+            )
+        else:
+            display_results(
+                df,
+                results,
+                query,
+                show_columns=list(show) if show else None,
+                is_regex=regex,
+                case_sensitive=case_sensitive
+            )
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Display cancelled[/yellow]")
+        sys.exit(0)
+    except Exception as e:
+        console.print(f"[red]Error displaying results: {e}[/red]")
+        sys.exit(1)
 
-        if (!itemsToDelete || !itemsToDelete.length) {
-            return [];
-        }
 
-        itemsToDelete.forEach(
-            function (item) {
-                item.remove();
-
-                if (item.id === this.activeDescendant) {
-                    this.clearActiveDescendant();
-                }
-            }.bind(this)
-        );
-
-        this.handleItemChange('removed', itemsToDelete);
-
-        return itemsToDelete;
-    }
-
-    clearActiveDescendant() {
-        this.activeDescendant = null;
-        this.dropdownNode.setAttribute('aria-activedescendant', null);
-
-        this.updateMoveButton();
-        this.checkUpDownButtons();
-    }
-
-    /**
-     * @description
-     *  Shifts the currently focused item up on the list. No shifting occurs if the
-     *  item is already at the top of the list.
-     */
-    moveUpItems() {
-        if (!this.activeDescendant) {
-            return;
-        }
-
-        const currentItem = document.getElementById(this.activeDescendant);
-        const previousItem = currentItem.previousElementSibling;
-
-        if (previousItem) {
-            this.dropdownNode.insertBefore(currentItem, previousItem);
-            this.handleItemChange('moved_up', [currentItem]);
-        }
-
-        this.checkUpDownButtons();
-    }
-
-    /**
-     * @description
-     *  Shifts the currently focused item down on the list. No shifting occurs if
-     *  the item is already at the end of the list.
-     */
-    moveDownItems() {
-        if (!this.activeDescendant) {
-            return;
-        }
-
-        var currentItem = document.getElementById(this.activeDescendant);
-        var nextItem = currentItem.nextElementSibling;
-
-        if (nextItem) {
-            this.dropdownNode.insertBefore(nextItem, currentItem);
-            this.handleItemChange('moved_down', [currentItem]);
-        }
-
-        this.checkUpDownButtons();
-    }
-
-    /**
-     * @description
-     *  Delete the currently selected items and add them to the sibling list.
-     */
-    moveItems() {
-        if (!this.siblingList) {
-            return;
-        }
-
-        var itemsToMove = this.deleteItems();
-        this.siblingList.addItems(itemsToMove);
-    }
-
-    /**
-     * @description
-     *  Enable Up/Down controls to shift items up and down.
-     * @param upButton
-     *   Up button to trigger up shift
-     * @param downButton
-     *   Down button to trigger down shift
-     */
-    enableMoveUpDown(upButton, downButton) {
-        this.moveUpDownEnabled = true;
-        this.upButton = upButton;
-        this.downButton = downButton;
-        upButton.addEventListener('click', this.moveUpItems.bind(this));
-        downButton.addEventListener('click', this.moveDownItems.bind(this));
-    }
-
-    /**
-     * @description
-     *  Enable Move controls. Moving removes selected items from the current
-     *  list and adds them to the sibling list.
-     * @param button
-     *   Move button to trigger delete
-     * @param siblingList
-     *   Listbox to move items to
-     */
-    setupMove(button, siblingList) {
-        this.siblingList = siblingList;
-        this.moveButton = button;
-        button.addEventListener('click', this.moveItems.bind(this));
-    }
-
-    setHandleItemChange(handlerFn) {
-        this.handleItemChange = handlerFn;
-    }
-
-    setHandleFocusChange(focusChangeHandler) {
-        this.handleFocusChange = focusChangeHandler;
-    }
-};
-
-export default Searchbox;
+if __name__ == '__main__':
+    main()
