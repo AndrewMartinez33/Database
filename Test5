@@ -1,17 +1,19 @@
 -- =====================================================
--- IMPACT ANALYSIS SUITE - FULLY CORRECTED
--- Understand what breaks when data/schema issues occur
--- =====================================================
-
--- =====================================================
--- QUERY 1: COMPLETE DEPENDENCY CHAIN (TOP-DOWN VIEW)
--- Shows everything that could be affected downstream
+-- BIDIRECTIONAL DEPENDENCY ANALYSIS
+-- Shows both what the object uses AND what uses it
 -- =====================================================
 
 DECLARE @TargetSchema NVARCHAR(128) = 'dbo';           -- Change this
-DECLARE @TargetObject NVARCHAR(256) = 'YourTableName'; -- Change this
+DECLARE @TargetObject NVARCHAR(256) = 'YourProcName'; -- Change this
 
-;WITH DependencyChain AS (
+-- =====================================================
+-- PART 1: DOWNSTREAM DEPENDENCIES
+-- What depends ON this object (what breaks if this changes)
+-- =====================================================
+
+PRINT '=== DOWNSTREAM: What depends ON ' + @TargetSchema + '.' + @TargetObject + ' ==='
+
+;WITH DownstreamChain AS (
     -- Level 0: The source object
     SELECT 
         o.object_id,
@@ -46,6 +48,7 @@ DECLARE @TargetObject NVARCHAR(256) = 'YourTableName'; -- Change this
         o.type,
         o.type_desc,
         CASE o.type
+            WHEN 'U' THEN 'TABLE'
             WHEN 'V' THEN 'VIEW'
             WHEN 'P' THEN 'STORED_PROCEDURE'
             WHEN 'FN' THEN 'SCALAR_FUNCTION'
@@ -56,32 +59,244 @@ DECLARE @TargetObject NVARCHAR(256) = 'YourTableName'; -- Change this
         END,
         dc.full_path + ' -> ' + SCHEMA_NAME(o.schema_id) + '.' + o.name,
         dc.dependency_level + 1
-    FROM DependencyChain dc
+    FROM DownstreamChain dc
     INNER JOIN sys.sql_expression_dependencies sed ON dc.object_id = sed.referenced_id
     INNER JOIN sys.objects o ON sed.referencing_id = o.object_id
-    WHERE dc.dependency_level < 20  -- Prevent infinite loops
+    WHERE dc.dependency_level < 20
         AND o.is_ms_shipped = 0
-        AND dc.full_path NOT LIKE '%' + SCHEMA_NAME(o.schema_id) + '.' + o.name + '%'  -- Prevent circular refs
+        AND dc.full_path NOT LIKE '%' + SCHEMA_NAME(o.schema_id) + '.' + o.name + '%'
 )
 
 SELECT 
     dependency_level AS level,
     schema_name,
     object_name,
-    object_type_desc,
     dependency_type AS object_type,
     full_path AS dependency_chain,
-    
-    -- Impact severity assessment
     CASE 
         WHEN dependency_level = 0 THEN '🎯 SOURCE OBJECT'
         WHEN dependency_level = 1 THEN '⚠️ DIRECT IMPACT - Will break immediately'
         WHEN dependency_level = 2 THEN '⚡ SECONDARY IMPACT - Will break if level 1 breaks'
         WHEN dependency_level >= 3 THEN '📊 CASCADE IMPACT - Multi-level cascade failure'
     END AS impact_severity,
-    
-    -- Get object definition to see how it's used
-    OBJECT_DEFINITION(object_id) AS object_definition
-
-FROM DependencyChain
+    'DOWNSTREAM' AS direction
+FROM DownstreamChain
+WHERE dependency_level > 0  -- Exclude the source object itself
 ORDER BY dependency_level, schema_name, object_name;
+
+-- =====================================================
+-- PART 2: UPSTREAM DEPENDENCIES
+-- What this object USES (what it depends on)
+-- =====================================================
+
+PRINT '=== UPSTREAM: What ' + @TargetSchema + '.' + @TargetObject + ' depends ON ==='
+
+;WITH UpstreamChain AS (
+    -- Level 0: The source object
+    SELECT 
+        o.object_id,
+        SCHEMA_NAME(o.schema_id) AS schema_name,
+        o.name AS object_name,
+        o.type AS object_type_code,
+        o.type_desc AS object_type_desc,
+        CASE o.type
+            WHEN 'U' THEN 'TABLE'
+            WHEN 'V' THEN 'VIEW'
+            WHEN 'P' THEN 'STORED_PROCEDURE'
+            WHEN 'FN' THEN 'SCALAR_FUNCTION'
+            WHEN 'IF' THEN 'INLINE_FUNCTION'
+            WHEN 'TF' THEN 'TABLE_FUNCTION'
+            WHEN 'TR' THEN 'TRIGGER'
+            ELSE o.type_desc
+        END AS dependency_type,
+        CAST(SCHEMA_NAME(o.schema_id) + '.' + o.name AS NVARCHAR(MAX)) AS full_path,
+        0 AS dependency_level
+    FROM sys.objects o
+    WHERE o.name = @TargetObject
+        AND SCHEMA_NAME(o.schema_id) = @TargetSchema
+        AND o.is_ms_shipped = 0
+    
+    UNION ALL
+    
+    -- Recursive: Find all objects this depends on
+    SELECT 
+        COALESCE(o.object_id, -1),
+        COALESCE(SCHEMA_NAME(o.schema_id), sed.referenced_schema_name, 'unknown'),
+        COALESCE(o.name, sed.referenced_entity_name, 'unknown'),
+        COALESCE(o.type, '??'),
+        COALESCE(o.type_desc, sed.referenced_class_desc, 'UNKNOWN'),
+        CASE o.type
+            WHEN 'U' THEN 'TABLE'
+            WHEN 'V' THEN 'VIEW'
+            WHEN 'P' THEN 'STORED_PROCEDURE'
+            WHEN 'FN' THEN 'SCALAR_FUNCTION'
+            WHEN 'IF' THEN 'INLINE_FUNCTION'
+            WHEN 'TF' THEN 'TABLE_FUNCTION'
+            WHEN 'TR' THEN 'TRIGGER'
+            ELSE COALESCE(o.type_desc, sed.referenced_class_desc, 'UNKNOWN')
+        END,
+        dc.full_path + ' -> ' + COALESCE(SCHEMA_NAME(o.schema_id), sed.referenced_schema_name, 'unknown') + '.' + 
+            COALESCE(o.name, sed.referenced_entity_name, 'unknown'),
+        dc.dependency_level + 1
+    FROM UpstreamChain dc
+    INNER JOIN sys.sql_expression_dependencies sed ON dc.object_id = sed.referencing_id
+    LEFT JOIN sys.objects o ON sed.referenced_id = o.object_id
+    WHERE dc.dependency_level < 20
+        AND (o.is_ms_shipped = 0 OR o.is_ms_shipped IS NULL)
+        AND dc.full_path NOT LIKE '%' + COALESCE(SCHEMA_NAME(o.schema_id), sed.referenced_schema_name, 'unknown') + '.' + 
+            COALESCE(o.name, sed.referenced_entity_name, 'unknown') + '%'
+)
+
+SELECT 
+    dependency_level AS level,
+    schema_name,
+    object_name,
+    dependency_type AS object_type,
+    full_path AS dependency_chain,
+    CASE 
+        WHEN dependency_level = 0 THEN '🎯 SOURCE OBJECT'
+        WHEN dependency_level = 1 THEN '📌 DIRECT DEPENDENCY - Uses this directly'
+        WHEN dependency_level = 2 THEN '📎 INDIRECT DEPENDENCY - Uses via level 1'
+        WHEN dependency_level >= 3 THEN '🔗 DEEP DEPENDENCY - Multi-level chain'
+    END AS dependency_severity,
+    'UPSTREAM' AS direction
+FROM UpstreamChain
+WHERE dependency_level > 0  -- Exclude the source object itself
+ORDER BY dependency_level, schema_name, object_name;
+
+-- =====================================================
+-- PART 3: DETAILED UPSTREAM DEPENDENCIES WITH COLUMNS
+-- Shows exactly what tables/columns are being used
+-- =====================================================
+
+PRINT '=== DETAILED: What ' + @TargetSchema + '.' + @TargetObject + ' uses (with columns) ==='
+
+SELECT 
+    COALESCE(SCHEMA_NAME(o.schema_id), sed.referenced_schema_name) AS referenced_schema,
+    COALESCE(o.name, sed.referenced_entity_name) AS referenced_object,
+    COALESCE(o.type_desc, sed.referenced_class_desc) AS object_type,
+    
+    -- If it's a specific column reference
+    CASE 
+        WHEN sed.referenced_minor_id > 0 THEN COL_NAME(sed.referenced_id, sed.referenced_minor_id)
+        ELSE '(All columns or object-level)'
+    END AS referenced_column,
+    
+    sed.is_ambiguous,
+    sed.is_caller_dependent,
+    
+    -- Show if it's a cross-database reference
+    CASE 
+        WHEN sed.referenced_database_name IS NOT NULL THEN sed.referenced_database_name
+        ELSE DB_NAME()
+    END AS database_name,
+    
+    sed.referenced_server_name,
+    
+    -- Impact level
+    CASE o.type
+        WHEN 'U' THEN '🔴 TABLE - Data dependency'
+        WHEN 'V' THEN '🟡 VIEW - May have underlying table dependencies'
+        WHEN 'P' THEN '🟢 PROCEDURE - Logic dependency'
+        WHEN 'FN' THEN '🟢 FUNCTION - Logic dependency'
+        WHEN 'IF' THEN '🟢 FUNCTION - Logic dependency'
+        WHEN 'TF' THEN '🟢 FUNCTION - Logic dependency'
+        ELSE '⚪ OTHER'
+    END AS dependency_impact
+
+FROM sys.sql_expression_dependencies sed
+LEFT JOIN sys.objects o ON sed.referenced_id = o.object_id
+WHERE sed.referencing_id = OBJECT_ID(@TargetSchema + '.' + @TargetObject)
+    AND (o.is_ms_shipped = 0 OR o.is_ms_shipped IS NULL)
+ORDER BY 
+    CASE o.type 
+        WHEN 'U' THEN 1  -- Tables first
+        WHEN 'V' THEN 2  -- Then views
+        WHEN 'P' THEN 3  -- Then procedures
+        ELSE 4
+    END,
+    referenced_schema,
+    referenced_object,
+    referenced_column;
+
+-- =====================================================
+-- PART 4: COMPLETE IMPACT SUMMARY
+-- =====================================================
+
+PRINT '=== SUMMARY ==='
+
+SELECT 
+    'COMPLETE IMPACT ANALYSIS FOR: ' + @TargetSchema + '.' + @TargetObject AS analysis_subject,
+    
+    -- What uses this object
+    (SELECT COUNT(DISTINCT o.object_id) 
+     FROM sys.sql_expression_dependencies sed
+     INNER JOIN sys.objects o ON sed.referencing_id = o.object_id
+     WHERE sed.referenced_id = OBJECT_ID(@TargetSchema + '.' + @TargetObject)
+     AND o.is_ms_shipped = 0) AS objects_that_depend_on_this,
+    
+    -- What this object uses
+    (SELECT COUNT(DISTINCT COALESCE(sed.referenced_id, -1))
+     FROM sys.sql_expression_dependencies sed
+     LEFT JOIN sys.objects o ON sed.referenced_id = o.object_id
+     WHERE sed.referencing_id = OBJECT_ID(@TargetSchema + '.' + @TargetObject)
+     AND (o.is_ms_shipped = 0 OR o.is_ms_shipped IS NULL)) AS objects_this_depends_on,
+    
+    -- Tables this uses
+    (SELECT COUNT(DISTINCT sed.referenced_id)
+     FROM sys.sql_expression_dependencies sed
+     INNER JOIN sys.objects o ON sed.referenced_id = o.object_id
+     WHERE sed.referencing_id = OBJECT_ID(@TargetSchema + '.' + @TargetObject)
+     AND o.type = 'U'
+     AND o.is_ms_shipped = 0) AS tables_used,
+    
+    -- Views this uses
+    (SELECT COUNT(DISTINCT sed.referenced_id)
+     FROM sys.sql_expression_dependencies sed
+     INNER JOIN sys.objects o ON sed.referenced_id = o.object_id
+     WHERE sed.referencing_id = OBJECT_ID(@TargetSchema + '.' + @TargetObject)
+     AND o.type = 'V'
+     AND o.is_ms_shipped = 0) AS views_used,
+    
+    -- Other procedures this calls
+    (SELECT COUNT(DISTINCT sed.referenced_id)
+     FROM sys.sql_expression_dependencies sed
+     INNER JOIN sys.objects o ON sed.referenced_id = o.object_id
+     WHERE sed.referencing_id = OBJECT_ID(@TargetSchema + '.' + @TargetObject)
+     AND o.type = 'P'
+     AND o.is_ms_shipped = 0) AS procedures_called,
+    
+    -- Functions this uses
+    (SELECT COUNT(DISTINCT sed.referenced_id)
+     FROM sys.sql_expression_dependencies sed
+     INNER JOIN sys.objects o ON sed.referenced_id = o.object_id
+     WHERE sed.referencing_id = OBJECT_ID(@TargetSchema + '.' + @TargetObject)
+     AND o.type IN ('FN', 'IF', 'TF')
+     AND o.is_ms_shipped = 0) AS functions_used;
+
+-- =====================================================
+-- PART 5: DEFINITION AND METADATA
+-- =====================================================
+
+PRINT '=== OBJECT DEFINITION ==='
+
+SELECT 
+    SCHEMA_NAME(o.schema_id) AS schema_name,
+    o.name AS object_name,
+    o.type_desc AS object_type,
+    o.create_date,
+    o.modify_date,
+    OBJECT_DEFINITION(o.object_id) AS object_definition,
+    
+    -- Parameter count for procedures/functions
+    (SELECT COUNT(*) FROM sys.parameters p WHERE p.object_id = o.object_id) AS parameter_count,
+    
+    -- Lines of code (approximate)
+    (SELECT COUNT(*) 
+     FROM (SELECT value FROM STRING_SPLIT(OBJECT_DEFINITION(o.object_id), CHAR(10))) AS lines
+     WHERE LEN(LTRIM(RTRIM(value))) > 0) AS approximate_lines_of_code
+
+FROM sys.objects o
+WHERE o.name = @TargetObject
+    AND SCHEMA_NAME(o.schema_id) = @TargetSchema
+    AND o.is_ms_shipped = 0;
