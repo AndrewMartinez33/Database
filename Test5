@@ -1,82 +1,124 @@
 -- =====================================================
--- COMPREHENSIVE DEPENDENCY ANALYSIS
--- Shows all object dependencies with detailed metadata
+-- IMPACT ANALYSIS SUITE
+-- Understand what breaks when data/schema issues occur
 -- =====================================================
 
-WITH DependencyTree AS (
+-- =====================================================
+-- QUERY 1: COMPLETE DEPENDENCY CHAIN (TOP-DOWN VIEW)
+-- Shows everything that could be affected downstream
+-- =====================================================
+
+DECLARE @TargetSchema NVARCHAR(128) = 'dbo';           -- Change this
+DECLARE @TargetObject NVARCHAR(256) = 'YourTableName'; -- Change this
+
+;WITH DependencyChain AS (
+    -- Level 0: The source object
     SELECT 
-        -- Referencing Object (the object that depends on something)
-        SCHEMA_NAME(o.schema_id) AS referencing_schema,
-        o.name AS referencing_object,
-        o.type_desc AS referencing_type,
+        OBJECT_ID(@TargetSchema + '.' + @TargetObject) AS object_id,
+        @TargetSchema AS schema_name,
+        @TargetObject AS object_name,
+        OBJECT_TYPE(@TargetSchema + '.' + @TargetObject) AS object_type,
+        CAST(@TargetSchema + '.' + @TargetObject AS NVARCHAR(MAX)) AS full_path,
+        0 AS dependency_level,
+        CAST(NULL AS NVARCHAR(MAX)) AS dependency_type
+    
+    UNION ALL
+    
+    -- Recursive: Find all objects that depend on this
+    SELECT 
+        o.object_id,
+        SCHEMA_NAME(o.schema_id),
+        o.name,
+        o.type,
+        dc.full_path + ' -> ' + SCHEMA_NAME(o.schema_id) + '.' + o.name,
+        dc.dependency_level + 1,
         CASE o.type
-            WHEN 'U' THEN 'Table'
-            WHEN 'V' THEN 'View'
-            WHEN 'P' THEN 'Stored Procedure'
-            WHEN 'FN' THEN 'Scalar Function'
-            WHEN 'IF' THEN 'Inline Table Function'
-            WHEN 'TF' THEN 'Table-Valued Function'
-            WHEN 'TR' THEN 'Trigger'
+            WHEN 'V' THEN 'VIEW'
+            WHEN 'P' THEN 'STORED_PROCEDURE'
+            WHEN 'FN' THEN 'FUNCTION'
+            WHEN 'IF' THEN 'INLINE_FUNCTION'
+            WHEN 'TF' THEN 'TABLE_FUNCTION'
+            WHEN 'TR' THEN 'TRIGGER'
             ELSE o.type_desc
-        END AS referencing_type_friendly,
-        
-        -- Referenced Object (the object being depended upon)
-        SCHEMA_NAME(ref_o.schema_id) AS referenced_schema,
-        ref_o.name AS referenced_object,
-        ref_o.type_desc AS referenced_type,
-        CASE ref_o.type
-            WHEN 'U' THEN 'Table'
-            WHEN 'V' THEN 'View'
-            WHEN 'P' THEN 'Stored Procedure'
-            WHEN 'FN' THEN 'Scalar Function'
-            WHEN 'IF' THEN 'Inline Table Function'
-            WHEN 'TF' THEN 'Table-Valued Function'
-            WHEN 'TR' THEN 'Trigger'
-            ELSE ref_o.type_desc
-        END AS referenced_type_friendly,
-        
-        -- Dependency Details
-        sed.referenced_entity_name,
-        sed.referenced_schema_name,
-        sed.referenced_class_desc,
-        sed.is_ambiguous,
-        sed.is_selected,
-        sed.is_updated,
-        sed.is_select_all,
-        
-        -- Full qualified names for clarity
-        QUOTENAME(SCHEMA_NAME(o.schema_id)) + '.' + QUOTENAME(o.name) AS referencing_full_name,
-        QUOTENAME(SCHEMA_NAME(ref_o.schema_id)) + '.' + QUOTENAME(ref_o.name) AS referenced_full_name,
-        
-        -- Dependency Level (for hierarchical understanding)
-        1 AS dependency_level
-
-    FROM sys.sql_expression_dependencies sed
+        END
+    FROM DependencyChain dc
+    INNER JOIN sys.sql_expression_dependencies sed ON dc.object_id = sed.referenced_id
     INNER JOIN sys.objects o ON sed.referencing_id = o.object_id
-    LEFT JOIN sys.objects ref_o ON sed.referenced_id = ref_o.object_id
-    WHERE o.is_ms_shipped = 0  -- Exclude system objects
-        AND (ref_o.is_ms_shipped = 0 OR ref_o.is_ms_shipped IS NULL)
-),
+    WHERE dc.dependency_level < 20  -- Prevent infinite loops
+        AND o.is_ms_shipped = 0
+        AND dc.full_path NOT LIKE '%' + SCHEMA_NAME(o.schema_id) + '.' + o.name + '%'  -- Prevent circular refs
+)
 
--- Foreign Key Dependencies
-ForeignKeyDependencies AS (
+SELECT 
+    dependency_level AS level,
+    schema_name,
+    object_name,
+    dependency_type AS object_type,
+    full_path AS dependency_chain,
+    
+    -- Impact severity assessment
+    CASE 
+        WHEN dependency_level = 0 THEN '🎯 SOURCE OBJECT'
+        WHEN dependency_level = 1 THEN '⚠️ DIRECT IMPACT - Will break immediately'
+        WHEN dependency_level = 2 THEN '⚡ SECONDARY IMPACT - Will break if level 1 breaks'
+        WHEN dependency_level >= 3 THEN '📊 CASCADE IMPACT - Multi-level cascade failure'
+    END AS impact_severity,
+    
+    -- Get object definition to see how it's used
+    OBJECT_DEFINITION(object_id) AS object_definition
+
+FROM DependencyChain
+ORDER BY dependency_level, schema_name, object_name;
+
+-- =====================================================
+-- QUERY 2: FOREIGN KEY IMPACT ANALYSIS
+-- Shows what tables will reject inserts/updates if data is bad
+-- =====================================================
+
+;WITH FKImpact AS (
     SELECT
-        SCHEMA_NAME(parent_obj.schema_id) AS referencing_schema,
-        parent_obj.name AS referencing_object,
-        'Table' AS referencing_type_friendly,
+        -- Parent table (the one with the FK constraint)
+        SCHEMA_NAME(parent_obj.schema_id) AS parent_schema,
+        parent_obj.name AS parent_table,
         
+        -- Referenced table (the one with the data)
         SCHEMA_NAME(ref_obj.schema_id) AS referenced_schema,
-        ref_obj.name AS referenced_object,
-        'Table' AS referenced_type_friendly,
+        ref_obj.name AS referenced_table,
         
+        -- FK details
         fk.name AS constraint_name,
-        parent_col.name AS referencing_column,
+        parent_col.name AS parent_column,
         ref_col.name AS referenced_column,
         
-        QUOTENAME(SCHEMA_NAME(parent_obj.schema_id)) + '.' + QUOTENAME(parent_obj.name) AS referencing_full_name,
-        QUOTENAME(SCHEMA_NAME(ref_obj.schema_id)) + '.' + QUOTENAME(ref_obj.name) AS referenced_full_name,
+        -- Referential actions
+        fk.delete_referential_action_desc AS on_delete_action,
+        fk.update_referential_action_desc AS on_update_action,
         
-        'FOREIGN_KEY' AS dependency_type
+        -- Status flags
+        fk.is_disabled,
+        fk.is_not_trusted,
+        fk.is_not_for_replication,
+        
+        -- Impact assessment
+        CASE 
+            WHEN fk.delete_referential_action_desc = 'CASCADE' THEN '🔴 CRITICAL: Deletes will CASCADE to ' + parent_obj.name
+            WHEN fk.delete_referential_action_desc = 'SET_NULL' THEN '🟡 WARNING: Deletes will SET NULL in ' + parent_obj.name
+            WHEN fk.delete_referential_action_desc = 'SET_DEFAULT' THEN '🟡 WARNING: Deletes will SET DEFAULT in ' + parent_obj.name
+            ELSE '🟢 SAFE: Deletes will be blocked if ' + parent_obj.name + ' has references'
+        END AS delete_impact,
+        
+        CASE 
+            WHEN fk.update_referential_action_desc = 'CASCADE' THEN '🔴 CRITICAL: Updates will CASCADE to ' + parent_obj.name
+            WHEN fk.update_referential_action_desc = 'SET_NULL' THEN '🟡 WARNING: Updates will SET NULL in ' + parent_obj.name
+            WHEN fk.update_referential_action_desc = 'SET_DEFAULT' THEN '🟡 WARNING: Updates will SET DEFAULT in ' + parent_obj.name
+            ELSE '🟢 SAFE: Updates will be blocked if ' + parent_obj.name + ' has references'
+        END AS update_impact,
+        
+        CASE 
+            WHEN fk.is_disabled = 1 THEN '❌ FK DISABLED - Not enforced!'
+            WHEN fk.is_not_trusted = 1 THEN '⚠️ FK NOT TRUSTED - May have bad data!'
+            ELSE '✅ FK Active and Trusted'
+        END AS constraint_status
 
     FROM sys.foreign_keys fk
     INNER JOIN sys.objects parent_obj ON fk.parent_object_id = parent_obj.object_id
@@ -90,99 +132,264 @@ ForeignKeyDependencies AS (
         AND ref_obj.is_ms_shipped = 0
 )
 
--- FINAL OUTPUT: All Dependencies
 SELECT 
-    referencing_schema,
-    referencing_object,
-    referencing_type_friendly AS referencing_type,
-    referencing_full_name,
+    referenced_schema + '.' + referenced_table AS source_table,
+    referenced_column AS source_column,
+    parent_schema + '.' + parent_table AS impacted_table,
+    parent_column AS impacted_column,
+    constraint_name,
+    delete_impact,
+    update_impact,
+    constraint_status,
     
-    referenced_schema,
-    referenced_object,
-    referenced_type_friendly AS referenced_type,
-    referenced_full_name,
-    
-    referenced_class_desc AS dependency_class,
+    -- Actionable recommendations
     CASE 
-        WHEN is_selected = 1 THEN 'SELECT'
-        WHEN is_updated = 1 THEN 'UPDATE'
-        ELSE 'REFERENCE'
-    END AS operation_type,
-    is_ambiguous,
-    
-    dependency_level,
-    
-    -- Usage Context
-    CASE 
-        WHEN is_select_all = 1 THEN 'Uses SELECT *'
-        WHEN is_selected = 1 AND is_updated = 1 THEN 'Reads and Writes'
-        WHEN is_selected = 1 THEN 'Read Only'
-        WHEN is_updated = 1 THEN 'Write Only'
-        ELSE 'Referenced'
-    END AS usage_pattern
+        WHEN is_disabled = 1 THEN '⚠️ RE-ENABLE this FK or data integrity is at risk'
+        WHEN is_not_trusted = 1 THEN '⚠️ RUN: ALTER TABLE ' + parent_schema + '.' + parent_table + 
+                                      ' WITH CHECK CHECK CONSTRAINT ' + constraint_name + 
+                                      ' -- This will verify data integrity'
+        WHEN on_delete_action = 'CASCADE' OR on_update_action = 'CASCADE' 
+            THEN '⚠️ CASCADE ACTION: Changes will automatically propagate - TEST CAREFULLY'
+        ELSE '✅ Standard FK behavior - changes blocked if references exist'
+    END AS recommended_action
 
-FROM DependencyTree
-
-UNION ALL
-
-SELECT
-    referencing_schema,
-    referencing_object,
-    referencing_type_friendly,
-    referencing_full_name,
-    
-    referenced_schema,
-    referenced_object,
-    referenced_type_friendly,
-    referenced_full_name,
-    
-    dependency_type AS dependency_class,
-    'FOREIGN KEY' AS operation_type,
-    0 AS is_ambiguous,
-    1 AS dependency_level,
-    'Foreign Key: ' + constraint_name + ' (' + referencing_column + ' -> ' + referenced_column + ')' AS usage_pattern
-
-FROM ForeignKeyDependencies
-
+FROM FKImpact
+WHERE referenced_schema + '.' + referenced_table = @TargetSchema + '.' + @TargetObject
+   OR parent_schema + '.' + parent_table = @TargetSchema + '.' + @TargetObject
 ORDER BY 
-    referencing_schema,
-    referencing_object,
-    referenced_schema,
-    referenced_object;
+    CASE WHEN on_delete_action = 'CASCADE' OR on_update_action = 'CASCADE' THEN 0 ELSE 1 END,
+    referenced_schema, referenced_table;
 
 -- =====================================================
--- BONUS: Dependency Impact Analysis
--- Shows what would be affected if an object is modified
+-- QUERY 3: COLUMN-LEVEL USAGE ANALYSIS
+-- Shows exactly where each column is used
 -- =====================================================
-
--- Run this with a specific object to see its impact
-DECLARE @ObjectName NVARCHAR(256) = 'YourObjectName';  -- Change this
-DECLARE @SchemaName NVARCHAR(128) = 'dbo';             -- Change this
 
 SELECT 
-    'DEPENDS ON THIS OBJECT' AS impact_direction,
-    SCHEMA_NAME(o.schema_id) AS affected_schema,
-    o.name AS affected_object,
-    o.type_desc AS affected_object_type,
-    o.create_date,
-    o.modify_date
-FROM sys.sql_expression_dependencies sed
-INNER JOIN sys.objects o ON sed.referencing_id = o.object_id
-WHERE sed.referenced_id = OBJECT_ID(@SchemaName + '.' + @ObjectName)
-    AND o.is_ms_shipped = 0
+    t.name AS table_name,
+    c.name AS column_name,
+    TYPE_NAME(c.user_type_id) AS data_type,
+    c.is_nullable,
+    
+    -- Find all objects that reference this column
+    STUFF((
+        SELECT DISTINCT ', ' + SCHEMA_NAME(o.schema_id) + '.' + o.name + ' (' + 
+               CASE o.type
+                   WHEN 'V' THEN 'VIEW'
+                   WHEN 'P' THEN 'PROC'
+                   WHEN 'FN' THEN 'FUNC'
+                   WHEN 'TR' THEN 'TRIGGER'
+                   ELSE o.type_desc
+               END + ')'
+        FROM sys.sql_expression_dependencies sed
+        INNER JOIN sys.objects o ON sed.referencing_id = o.object_id
+        WHERE sed.referenced_id = t.object_id
+            AND sed.referenced_minor_id = c.column_id
+            AND o.is_ms_shipped = 0
+        FOR XML PATH(''), TYPE
+    ).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS used_in_objects,
+    
+    -- Check if used in indexes
+    STUFF((
+        SELECT ', ' + i.name + ' (' + i.type_desc + 
+               CASE WHEN i.is_primary_key = 1 THEN ', PK' 
+                    WHEN i.is_unique = 1 THEN ', UNIQUE' 
+                    ELSE '' END + ')'
+        FROM sys.index_columns ic
+        INNER JOIN sys.indexes i ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+        WHERE ic.object_id = t.object_id
+            AND ic.column_id = c.column_id
+            AND i.name IS NOT NULL
+        FOR XML PATH(''), TYPE
+    ).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS used_in_indexes,
+    
+    -- Check if used in FK constraints
+    STUFF((
+        SELECT ', ' + fk.name + ' -> ' + 
+               SCHEMA_NAME(ref_obj.schema_id) + '.' + ref_obj.name + '.' + 
+               ref_col.name
+        FROM sys.foreign_key_columns fkc
+        INNER JOIN sys.foreign_keys fk ON fkc.constraint_object_id = fk.object_id
+        INNER JOIN sys.objects ref_obj ON fk.referenced_object_id = ref_obj.object_id
+        INNER JOIN sys.columns ref_col ON fkc.referenced_object_id = ref_col.object_id 
+            AND fkc.referenced_column_id = ref_col.column_id
+        WHERE fkc.parent_object_id = t.object_id
+            AND fkc.parent_column_id = c.column_id
+        FOR XML PATH(''), TYPE
+    ).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS foreign_key_to,
+    
+    -- Check if referenced by FK constraints
+    STUFF((
+        SELECT ', ' + fk.name + ' <- ' + 
+               SCHEMA_NAME(parent_obj.schema_id) + '.' + parent_obj.name + '.' + 
+               parent_col.name
+        FROM sys.foreign_key_columns fkc
+        INNER JOIN sys.foreign_keys fk ON fkc.constraint_object_id = fk.object_id
+        INNER JOIN sys.objects parent_obj ON fk.parent_object_id = parent_obj.object_id
+        INNER JOIN sys.columns parent_col ON fkc.parent_object_id = parent_col.object_id 
+            AND fkc.parent_column_id = parent_col.column_id
+        WHERE fkc.referenced_object_id = t.object_id
+            AND fkc.referenced_column_id = c.column_id
+        FOR XML PATH(''), TYPE
+    ).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS referenced_by_fk,
+    
+    -- Impact assessment
+    CASE 
+        WHEN c.is_identity = 1 THEN '🔴 IDENTITY COLUMN - Critical for references'
+        WHEN EXISTS (
+            SELECT 1 FROM sys.index_columns ic
+            INNER JOIN sys.indexes i ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+            WHERE ic.object_id = t.object_id AND ic.column_id = c.column_id AND i.is_primary_key = 1
+        ) THEN '🔴 PRIMARY KEY - Critical for all relationships'
+        WHEN EXISTS (
+            SELECT 1 FROM sys.foreign_key_columns fkc
+            WHERE fkc.referenced_object_id = t.object_id AND fkc.referenced_column_id = c.column_id
+        ) THEN '🟠 REFERENCED BY FK - Changes will affect child tables'
+        WHEN EXISTS (
+            SELECT 1 FROM sys.foreign_key_columns fkc
+            WHERE fkc.parent_object_id = t.object_id AND fkc.parent_column_id = c.column_id
+        ) THEN '🟡 HAS FK - Must exist in parent table'
+        WHEN EXISTS (
+            SELECT 1 FROM sys.sql_expression_dependencies sed
+            WHERE sed.referenced_id = t.object_id AND sed.referenced_minor_id = c.column_id
+        ) THEN '🟢 USED IN OBJECTS - May impact views/procs'
+        ELSE '⚪ LOW IMPACT - Column appears isolated'
+    END AS impact_level,
+    
+    -- Recommendations
+    CASE 
+        WHEN c.is_nullable = 1 THEN '✅ NULL allowed - Changes safer'
+        ELSE '⚠️ NOT NULL - Must provide valid values'
+    END AS change_safety
 
+FROM sys.tables t
+INNER JOIN sys.columns c ON t.object_id = c.object_id
+WHERE t.is_ms_shipped = 0
+    AND t.name = @TargetObject
+    AND SCHEMA_NAME(t.schema_id) = @TargetSchema
+ORDER BY 
+    CASE 
+        WHEN c.is_identity = 1 THEN 0
+        WHEN EXISTS (SELECT 1 FROM sys.index_columns ic INNER JOIN sys.indexes i ON ic.object_id = i.object_id 
+                     AND ic.index_id = i.index_id WHERE ic.object_id = t.object_id 
+                     AND ic.column_id = c.column_id AND i.is_primary_key = 1) THEN 1
+        ELSE 2
+    END,
+    c.column_id;
+
+-- =====================================================
+-- QUERY 4: TRIGGER IMPACT ANALYSIS
+-- Shows what automatic actions will fire
+-- =====================================================
+
+SELECT 
+    SCHEMA_NAME(parent_obj.schema_id) AS table_schema,
+    parent_obj.name AS table_name,
+    tr.name AS trigger_name,
+    tr.is_disabled,
+    tr.is_instead_of_trigger,
+    
+    -- Trigger events
+    STUFF((
+        SELECT ', ' + te.type_desc
+        FROM sys.trigger_events te
+        WHERE te.object_id = tr.object_id
+        FOR XML PATH('')
+    ), 1, 2, '') AS trigger_events,
+    
+    -- Get trigger definition to understand what happens
+    OBJECT_DEFINITION(tr.object_id) AS trigger_code,
+    
+    -- Impact assessment
+    CASE 
+        WHEN tr.is_disabled = 1 THEN '⚪ DISABLED - Will not fire'
+        WHEN tr.is_instead_of_trigger = 1 THEN '🔴 INSTEAD OF - Replaces normal operation!'
+        ELSE '🟠 AFTER TRIGGER - Runs automatically after operation'
+    END AS trigger_impact,
+    
+    tr.create_date,
+    tr.modify_date
+
+FROM sys.triggers tr
+INNER JOIN sys.objects parent_obj ON tr.parent_id = parent_obj.object_id
+WHERE parent_obj.is_ms_shipped = 0
+    AND parent_obj.name = @TargetObject
+    AND SCHEMA_NAME(parent_obj.schema_id) = @TargetSchema
+ORDER BY tr.is_disabled, tr.name;
+
+-- =====================================================
+-- QUERY 5: DATA VALIDATION & INTEGRITY CHECKS
+-- Finds potential data quality issues
+-- =====================================================
+
+-- Generate dynamic SQL to check for common data issues
+DECLARE @SQL NVARCHAR(MAX) = '';
+
+SELECT @SQL = @SQL + '
+-- Check: ' + c.name + '
+SELECT 
+    ''' + @TargetSchema + '.' + @TargetObject + ''' AS table_name,
+    ''' + c.name + ''' AS column_name,
+    COUNT(*) AS total_rows,
+    COUNT(' + QUOTENAME(c.name) + ') AS non_null_count,
+    COUNT(*) - COUNT(' + QUOTENAME(c.name) + ') AS null_count,
+    COUNT(DISTINCT ' + QUOTENAME(c.name) + ') AS distinct_values' +
+    CASE 
+        WHEN TYPE_NAME(c.user_type_id) IN ('varchar', 'nvarchar', 'char', 'nchar') THEN ',
+    SUM(CASE WHEN LEN(' + QUOTENAME(c.name) + ') = 0 THEN 1 ELSE 0 END) AS empty_string_count,
+    SUM(CASE WHEN ' + QUOTENAME(c.name) + ' LIKE ''%  %'' THEN 1 ELSE 0 END) AS double_space_count,
+    SUM(CASE WHEN ' + QUOTENAME(c.name) + ' <> LTRIM(RTRIM(' + QUOTENAME(c.name) + ')) THEN 1 ELSE 0 END) AS trim_needed_count'
+        ELSE ''
+    END +
+'
+FROM ' + QUOTENAME(@TargetSchema) + '.' + QUOTENAME(@TargetObject) + '
 UNION ALL
+'
+FROM sys.columns c
+INNER JOIN sys.tables t ON c.object_id = t.object_id
+WHERE t.name = @TargetObject
+    AND SCHEMA_NAME(t.schema_id) = @TargetSchema
+    AND t.is_ms_shipped = 0;
+
+-- Remove trailing UNION ALL
+SET @SQL = LEFT(@SQL, LEN(@SQL) - 11);
+
+-- Uncomment to execute:
+-- EXEC sp_executesql @SQL;
+PRINT @SQL;  -- Print for review
+
+-- =====================================================
+-- QUERY 6: EXECUTION PLAN ANALYSIS
+-- Find queries that will be affected (from plan cache)
+-- =====================================================
 
 SELECT 
-    'THIS OBJECT DEPENDS ON' AS impact_direction,
-    SCHEMA_NAME(ref_o.schema_id) AS affected_schema,
-    ref_o.name AS affected_object,
-    ref_o.type_desc AS affected_object_type,
-    ref_o.create_date,
-    ref_o.modify_date
-FROM sys.sql_expression_dependencies sed
-INNER JOIN sys.objects ref_o ON sed.referenced_id = ref_o.object_id
-WHERE sed.referencing_id = OBJECT_ID(@SchemaName + '.' + @ObjectName)
-    AND ref_o.is_ms_shipped = 0
+    qs.execution_count,
+    qs.total_worker_time / qs.execution_count AS avg_cpu_time,
+    qs.total_elapsed_time / qs.execution_count AS avg_duration,
+    qs.total_logical_reads / qs.execution_count AS avg_logical_reads,
+    qs.last_execution_time,
+    
+    -- Get the query text
+    SUBSTRING(qt.text, (qs.statement_start_offset/2) + 1,
+        ((CASE qs.statement_end_offset
+            WHEN -1 THEN DATALENGTH(qt.text)
+            ELSE qs.statement_end_offset
+        END - qs.statement_start_offset)/2) + 1) AS query_text,
+    
+    -- Get the query plan
+    qp.query_plan,
+    
+    -- Impact assessment
+    CASE 
+        WHEN qs.execution_count > 1000 THEN '🔴 HIGH VOLUME - Affects many operations'
+        WHEN qs.execution_count > 100 THEN '🟠 MEDIUM VOLUME'
+        ELSE '🟢 LOW VOLUME'
+    END AS volume_impact
 
-ORDER BY impact_direction, affected_schema, affected_object;
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) qt
+CROSS APPLY sys.dm_exec_query_plan(qs.plan_handle) qp
+WHERE qt.text LIKE '%' + @TargetSchema + '.' + @TargetObject + '%'
+    AND qt.text NOT LIKE '%sys.dm_exec_query_stats%'  -- Exclude this query
+ORDER BY qs.execution_count DESC;
