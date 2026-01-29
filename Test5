@@ -1,5 +1,5 @@
 -- =====================================================
--- IMPACT ANALYSIS SUITE - CORRECTED
+-- IMPACT ANALYSIS SUITE - FULLY CORRECTED
 -- Understand what breaks when data/schema issues occur
 -- =====================================================
 
@@ -17,11 +17,20 @@ DECLARE @TargetObject NVARCHAR(256) = 'YourTableName'; -- Change this
         o.object_id,
         SCHEMA_NAME(o.schema_id) AS schema_name,
         o.name AS object_name,
-        o.type AS object_type,
+        o.type AS object_type_code,
         o.type_desc AS object_type_desc,
+        CASE o.type
+            WHEN 'U' THEN 'TABLE'
+            WHEN 'V' THEN 'VIEW'
+            WHEN 'P' THEN 'STORED_PROCEDURE'
+            WHEN 'FN' THEN 'SCALAR_FUNCTION'
+            WHEN 'IF' THEN 'INLINE_FUNCTION'
+            WHEN 'TF' THEN 'TABLE_FUNCTION'
+            WHEN 'TR' THEN 'TRIGGER'
+            ELSE o.type_desc
+        END AS dependency_type,
         CAST(SCHEMA_NAME(o.schema_id) + '.' + o.name AS NVARCHAR(MAX)) AS full_path,
-        0 AS dependency_level,
-        CAST(NULL AS NVARCHAR(MAX)) AS dependency_type
+        0 AS dependency_level
     FROM sys.objects o
     WHERE o.name = @TargetObject
         AND SCHEMA_NAME(o.schema_id) = @TargetSchema
@@ -36,8 +45,6 @@ DECLARE @TargetObject NVARCHAR(256) = 'YourTableName'; -- Change this
         o.name,
         o.type,
         o.type_desc,
-        dc.full_path + ' -> ' + SCHEMA_NAME(o.schema_id) + '.' + o.name,
-        dc.dependency_level + 1,
         CASE o.type
             WHEN 'V' THEN 'VIEW'
             WHEN 'P' THEN 'STORED_PROCEDURE'
@@ -46,7 +53,9 @@ DECLARE @TargetObject NVARCHAR(256) = 'YourTableName'; -- Change this
             WHEN 'TF' THEN 'TABLE_FUNCTION'
             WHEN 'TR' THEN 'TRIGGER'
             ELSE o.type_desc
-        END
+        END,
+        dc.full_path + ' -> ' + SCHEMA_NAME(o.schema_id) + '.' + o.name,
+        dc.dependency_level + 1
     FROM DependencyChain dc
     INNER JOIN sys.sql_expression_dependencies sed ON dc.object_id = sed.referenced_id
     INNER JOIN sys.objects o ON sed.referencing_id = o.object_id
