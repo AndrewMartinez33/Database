@@ -1,77 +1,188 @@
- <div id="modal-container">
-  <dialog id="my-modal" class="modal">
-    <div class="modal-content">
-      <p>This is the modal content.</p>
-      <button id="close-btn">Close</button>
-    </div>
-  </dialog>
-</div>
+-- =====================================================
+-- COMPREHENSIVE DEPENDENCY ANALYSIS
+-- Shows all object dependencies with detailed metadata
+-- =====================================================
 
-class Modal {
-  constructor(id) {
-    this.modal = document.getElementById(id);
-    this.closeButton = document.getElementById('close-btn');
-    this.isOpen = false;
+WITH DependencyTree AS (
+    SELECT 
+        -- Referencing Object (the object that depends on something)
+        SCHEMA_NAME(o.schema_id) AS referencing_schema,
+        o.name AS referencing_object,
+        o.type_desc AS referencing_type,
+        CASE o.type
+            WHEN 'U' THEN 'Table'
+            WHEN 'V' THEN 'View'
+            WHEN 'P' THEN 'Stored Procedure'
+            WHEN 'FN' THEN 'Scalar Function'
+            WHEN 'IF' THEN 'Inline Table Function'
+            WHEN 'TF' THEN 'Table-Valued Function'
+            WHEN 'TR' THEN 'Trigger'
+            ELSE o.type_desc
+        END AS referencing_type_friendly,
+        
+        -- Referenced Object (the object being depended upon)
+        SCHEMA_NAME(ref_o.schema_id) AS referenced_schema,
+        ref_o.name AS referenced_object,
+        ref_o.type_desc AS referenced_type,
+        CASE ref_o.type
+            WHEN 'U' THEN 'Table'
+            WHEN 'V' THEN 'View'
+            WHEN 'P' THEN 'Stored Procedure'
+            WHEN 'FN' THEN 'Scalar Function'
+            WHEN 'IF' THEN 'Inline Table Function'
+            WHEN 'TF' THEN 'Table-Valued Function'
+            WHEN 'TR' THEN 'Trigger'
+            ELSE ref_o.type_desc
+        END AS referenced_type_friendly,
+        
+        -- Dependency Details
+        sed.referenced_entity_name,
+        sed.referenced_schema_name,
+        sed.referenced_class_desc,
+        sed.is_ambiguous,
+        sed.is_selected,
+        sed.is_updated,
+        sed.is_select_all,
+        
+        -- Full qualified names for clarity
+        QUOTENAME(SCHEMA_NAME(o.schema_id)) + '.' + QUOTENAME(o.name) AS referencing_full_name,
+        QUOTENAME(SCHEMA_NAME(ref_o.schema_id)) + '.' + QUOTENAME(ref_o.name) AS referenced_full_name,
+        
+        -- Dependency Level (for hierarchical understanding)
+        1 AS dependency_level
 
-    this.closeButton.addEventListener('click', () => this.close());
-  }
+    FROM sys.sql_expression_dependencies sed
+    INNER JOIN sys.objects o ON sed.referencing_id = o.object_id
+    LEFT JOIN sys.objects ref_o ON sed.referenced_id = ref_o.object_id
+    WHERE o.is_ms_shipped = 0  -- Exclude system objects
+        AND (ref_o.is_ms_shipped = 0 OR ref_o.is_ms_shipped IS NULL)
+),
 
-  open() {
-    this.modal.showModal();
-    this.modal.classList.add('open'); // Add animation class
-    this.isOpen = true;
-  }
+-- Foreign Key Dependencies
+ForeignKeyDependencies AS (
+    SELECT
+        SCHEMA_NAME(parent_obj.schema_id) AS referencing_schema,
+        parent_obj.name AS referencing_object,
+        'Table' AS referencing_type_friendly,
+        
+        SCHEMA_NAME(ref_obj.schema_id) AS referenced_schema,
+        ref_obj.name AS referenced_object,
+        'Table' AS referenced_type_friendly,
+        
+        fk.name AS constraint_name,
+        parent_col.name AS referencing_column,
+        ref_col.name AS referenced_column,
+        
+        QUOTENAME(SCHEMA_NAME(parent_obj.schema_id)) + '.' + QUOTENAME(parent_obj.name) AS referencing_full_name,
+        QUOTENAME(SCHEMA_NAME(ref_obj.schema_id)) + '.' + QUOTENAME(ref_obj.name) AS referenced_full_name,
+        
+        'FOREIGN_KEY' AS dependency_type
 
-  close() {
-    this.modal.close();
-    this.modal.classList.remove('open');
-    this.isOpen = false;
-  }
-}
+    FROM sys.foreign_keys fk
+    INNER JOIN sys.objects parent_obj ON fk.parent_object_id = parent_obj.object_id
+    INNER JOIN sys.objects ref_obj ON fk.referenced_object_id = ref_obj.object_id
+    INNER JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
+    INNER JOIN sys.columns parent_col ON fkc.parent_object_id = parent_col.object_id 
+        AND fkc.parent_column_id = parent_col.column_id
+    INNER JOIN sys.columns ref_col ON fkc.referenced_object_id = ref_col.object_id 
+        AND fkc.referenced_column_id = ref_col.column_id
+    WHERE parent_obj.is_ms_shipped = 0
+        AND ref_obj.is_ms_shipped = 0
+)
 
-const myModal = new Modal('my-modal');
+-- FINAL OUTPUT: All Dependencies
+SELECT 
+    referencing_schema,
+    referencing_object,
+    referencing_type_friendly AS referencing_type,
+    referencing_full_name,
+    
+    referenced_schema,
+    referenced_object,
+    referenced_type_friendly AS referenced_type,
+    referenced_full_name,
+    
+    referenced_class_desc AS dependency_class,
+    CASE 
+        WHEN is_selected = 1 THEN 'SELECT'
+        WHEN is_updated = 1 THEN 'UPDATE'
+        ELSE 'REFERENCE'
+    END AS operation_type,
+    is_ambiguous,
+    
+    dependency_level,
+    
+    -- Usage Context
+    CASE 
+        WHEN is_select_all = 1 THEN 'Uses SELECT *'
+        WHEN is_selected = 1 AND is_updated = 1 THEN 'Reads and Writes'
+        WHEN is_selected = 1 THEN 'Read Only'
+        WHEN is_updated = 1 THEN 'Write Only'
+        ELSE 'Referenced'
+    END AS usage_pattern
 
-// Example usage
-document.getElementById('open-modal-btn').addEventListener('click', () => {
-  if (!myModal.isOpen) {
-    myModal.open();
-  }
-});
+FROM DependencyTree
 
+UNION ALL
 
+SELECT
+    referencing_schema,
+    referencing_object,
+    referencing_type_friendly,
+    referencing_full_name,
+    
+    referenced_schema,
+    referenced_object,
+    referenced_type_friendly,
+    referenced_full_name,
+    
+    dependency_type AS dependency_class,
+    'FOREIGN KEY' AS operation_type,
+    0 AS is_ambiguous,
+    1 AS dependency_level,
+    'Foreign Key: ' + constraint_name + ' (' + referencing_column + ' -> ' + referenced_column + ')' AS usage_pattern
 
-.modal-container {
-  display: none; /* Hide container initially */
-}
+FROM ForeignKeyDependencies
 
-.modal {
-  position: fixed;
-  bottom: 0;
-  left: 0;
-  width: 100%;
-  height: 0;
-  background-color: rgba(0, 0, 0, 0.4);
-  transition: height 0.3s ease-in-out;
-  transform: translateY(100%); /* Initially hidden off-screen */
-}
+ORDER BY 
+    referencing_schema,
+    referencing_object,
+    referenced_schema,
+    referenced_object;
 
-.modal.open {
-  height: calc(100vh - 50px); /* Adjust height as needed */
-  transform: translateY(0);
-}
+-- =====================================================
+-- BONUS: Dependency Impact Analysis
+-- Shows what would be affected if an object is modified
+-- =====================================================
 
-.modal-content {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  background-color: white;
-  padding: 20px;
-  border-radius: 5px;
-}
+-- Run this with a specific object to see its impact
+DECLARE @ObjectName NVARCHAR(256) = 'YourObjectName';  -- Change this
+DECLARE @SchemaName NVARCHAR(128) = 'dbo';             -- Change this
 
-/* Style the close button */
-#close-btn {
-  /* ... */
-}
+SELECT 
+    'DEPENDS ON THIS OBJECT' AS impact_direction,
+    SCHEMA_NAME(o.schema_id) AS affected_schema,
+    o.name AS affected_object,
+    o.type_desc AS affected_object_type,
+    o.create_date,
+    o.modify_date
+FROM sys.sql_expression_dependencies sed
+INNER JOIN sys.objects o ON sed.referencing_id = o.object_id
+WHERE sed.referenced_id = OBJECT_ID(@SchemaName + '.' + @ObjectName)
+    AND o.is_ms_shipped = 0
 
+UNION ALL
+
+SELECT 
+    'THIS OBJECT DEPENDS ON' AS impact_direction,
+    SCHEMA_NAME(ref_o.schema_id) AS affected_schema,
+    ref_o.name AS affected_object,
+    ref_o.type_desc AS affected_object_type,
+    ref_o.create_date,
+    ref_o.modify_date
+FROM sys.sql_expression_dependencies sed
+INNER JOIN sys.objects ref_o ON sed.referenced_id = ref_o.object_id
+WHERE sed.referencing_id = OBJECT_ID(@SchemaName + '.' + @ObjectName)
+    AND ref_o.is_ms_shipped = 0
+
+ORDER BY impact_direction, affected_schema, affected_object;
