@@ -1,281 +1,204 @@
+-- =====================================================
+-- COMPREHENSIVE DATA DICTIONARY QUERY
+-- Extracts all database objects with relevant metadata
+-- =====================================================
 
-# datavalidator.py
+WITH ObjectDetails AS (
+    SELECT 
+        -- Object Identification
+        o.object_id,
+        SCHEMA_NAME(o.schema_id) AS schema_name,
+        o.name AS object_name,
+        o.type_desc AS object_type,
+        CASE o.type
+            WHEN 'U' THEN 'Table (User-Defined)'
+            WHEN 'V' THEN 'View'
+            WHEN 'P' THEN 'Stored Procedure'
+            WHEN 'FN' THEN 'Scalar Function'
+            WHEN 'IF' THEN 'Inline Table-Valued Function'
+            WHEN 'TF' THEN 'Table-Valued Function'
+            WHEN 'TR' THEN 'Trigger'
+            ELSE o.type_desc
+        END AS object_type_friendly,
+        
+        -- Metadata
+        o.create_date,
+        o.modify_date,
+        OBJECTPROPERTYEX(o.object_id, 'BaseType') AS base_type,
+        
+        -- Extended Properties (Description/Comments)
+        CAST(ep.value AS NVARCHAR(MAX)) AS object_description
+        
+    FROM sys.objects o
+    LEFT JOIN sys.extended_properties ep 
+        ON ep.major_id = o.object_id 
+        AND ep.minor_id = 0 
+        AND ep.name = 'MS_Description'
+    WHERE o.type IN ('U', 'V', 'P', 'FN', 'IF', 'TF')
+        AND o.is_ms_shipped = 0  -- Exclude system objects
+),
 
-import re
-import uuid
-import pandas as pd
-import polars as pl
-from datetime import datetime
+ColumnDetails AS (
+    SELECT
+        c.object_id,
+        c.column_id,
+        c.name AS column_name,
+        TYPE_NAME(c.user_type_id) AS data_type,
+        c.max_length,
+        c.precision,
+        c.scale,
+        c.is_nullable,
+        c.is_identity,
+        c.is_computed,
+        cc.definition AS computed_column_definition,
+        dc.definition AS default_constraint,
+        CAST(ep.value AS NVARCHAR(MAX)) AS column_description,
+        
+        -- Primary Key Information
+        CASE WHEN ic.index_column_id IS NOT NULL AND i.is_primary_key = 1 
+            THEN 'YES' ELSE 'NO' END AS is_primary_key,
+        
+        -- Foreign Key Information
+        STUFF((
+            SELECT ', ' + OBJECT_SCHEMA_NAME(fk.referenced_object_id) + '.' + 
+                   OBJECT_NAME(fk.referenced_object_id) + '(' + 
+                   COL_NAME(fkc.referenced_object_id, fkc.referenced_column_id) + ')'
+            FROM sys.foreign_key_columns fkc
+            INNER JOIN sys.foreign_keys fk ON fkc.constraint_object_id = fk.object_id
+            WHERE fkc.parent_object_id = c.object_id 
+                AND fkc.parent_column_id = c.column_id
+            FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS foreign_key_references,
+        
+        -- Index Information
+        STUFF((
+            SELECT ', ' + i2.name + ' (' + 
+                   CASE WHEN i2.is_primary_key = 1 THEN 'PK' 
+                        WHEN i2.is_unique = 1 THEN 'UQ' 
+                        ELSE 'IX' END + ')'
+            FROM sys.index_columns ic2
+            INNER JOIN sys.indexes i2 ON ic2.object_id = i2.object_id 
+                AND ic2.index_id = i2.index_id
+            WHERE ic2.object_id = c.object_id 
+                AND ic2.column_id = c.column_id
+                AND i2.name IS NOT NULL
+            FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS indexes
+        
+    FROM sys.columns c
+    LEFT JOIN sys.computed_columns cc ON c.object_id = cc.object_id 
+        AND c.column_id = cc.column_id
+    LEFT JOIN sys.default_constraints dc ON c.default_object_id = dc.object_id
+    LEFT JOIN sys.extended_properties ep ON ep.major_id = c.object_id 
+        AND ep.minor_id = c.column_id 
+        AND ep.name = 'MS_Description'
+    LEFT JOIN sys.index_columns ic ON ic.object_id = c.object_id 
+        AND ic.column_id = c.column_id
+    LEFT JOIN sys.indexes i ON ic.object_id = i.object_id 
+        AND ic.index_id = i.index_id 
+        AND i.is_primary_key = 1
+    WHERE c.object_id IN (SELECT object_id FROM ObjectDetails WHERE object_type IN ('USER_TABLE', 'VIEW'))
+),
 
-# ------------------------
-# Validator Implementations
-# ------------------------
-
-def _pandas_is_uuid(series: pd.Series) -> pd.Series:
-    return series.astype(str).str.match(
-        r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
-        na=False,
+ParameterDetails AS (
+    SELECT
+        p.object_id,
+        p.parameter_id,
+        p.name AS parameter_name,
+        TYPE_NAME(p.user_type_id) AS parameter_type,
+        p.max_length,
+        p.precision,
+        p.scale,
+        p.is_output,
+        p.has_default_value,
+        p.default_value
+    FROM sys.parameters p
+    WHERE p.object_id IN (
+        SELECT object_id FROM ObjectDetails 
+        WHERE object_type IN ('SQL_STORED_PROCEDURE', 'SQL_SCALAR_FUNCTION', 
+                              'SQL_INLINE_TABLE_VALUED_FUNCTION', 'SQL_TABLE_VALUED_FUNCTION')
     )
+),
 
-def _polars_is_uuid(series: pl.Series) -> pl.Series:
-    return series.str.contains(
-        r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-    )
+TableStats AS (
+    SELECT
+        t.object_id,
+        SUM(p.rows) AS row_count,
+        SUM(a.total_pages) * 8 / 1024.0 AS total_space_mb,
+        SUM(a.used_pages) * 8 / 1024.0 AS used_space_mb,
+        SUM(a.data_pages) * 8 / 1024.0 AS data_space_mb
+    FROM sys.tables t
+    INNER JOIN sys.partitions p ON t.object_id = p.object_id
+    INNER JOIN sys.allocation_units a ON p.partition_id = a.container_id
+    WHERE p.index_id IN (0, 1)  -- Heap or Clustered Index
+    GROUP BY t.object_id
+)
 
-def _pandas_is_email(series: pd.Series) -> pd.Series:
-    return series.astype(str).str.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", na=False)
+-- FINAL OUTPUT: Complete Data Dictionary
+SELECT 
+    od.schema_name,
+    od.object_name,
+    od.object_type_friendly AS object_type,
+    od.create_date,
+    od.modify_date,
+    od.object_description,
+    
+    -- For Tables and Views: Column Information
+    cd.column_name,
+    cd.data_type,
+    CASE 
+        WHEN cd.data_type IN ('varchar', 'nvarchar', 'char', 'nchar', 'varbinary', 'binary') 
+        THEN cd.data_type + '(' + 
+             CASE WHEN cd.max_length = -1 THEN 'MAX' 
+                  WHEN cd.data_type LIKE 'n%' THEN CAST(cd.max_length/2 AS VARCHAR(10))
+                  ELSE CAST(cd.max_length AS VARCHAR(10)) END + ')'
+        WHEN cd.data_type IN ('decimal', 'numeric') 
+        THEN cd.data_type + '(' + CAST(cd.precision AS VARCHAR(10)) + ',' + 
+             CAST(cd.scale AS VARCHAR(10)) + ')'
+        ELSE cd.data_type
+    END AS full_data_type,
+    cd.is_nullable,
+    cd.is_identity,
+    cd.is_primary_key,
+    cd.foreign_key_references,
+    cd.default_constraint,
+    cd.is_computed,
+    cd.computed_column_definition,
+    cd.indexes AS column_indexes,
+    cd.column_description,
+    
+    -- For Stored Procedures and Functions: Parameter Information
+    pd.parameter_name,
+    pd.parameter_type,
+    CASE 
+        WHEN pd.parameter_type IN ('varchar', 'nvarchar', 'char', 'nchar', 'varbinary', 'binary') 
+        THEN pd.parameter_type + '(' + 
+             CASE WHEN pd.max_length = -1 THEN 'MAX' 
+                  WHEN pd.parameter_type LIKE 'n%' THEN CAST(pd.max_length/2 AS VARCHAR(10))
+                  ELSE CAST(pd.max_length AS VARCHAR(10)) END + ')'
+        WHEN pd.parameter_type IN ('decimal', 'numeric') 
+        THEN pd.parameter_type + '(' + CAST(pd.precision AS VARCHAR(10)) + ',' + 
+             CAST(pd.scale AS VARCHAR(10)) + ')'
+        ELSE pd.parameter_type
+    END AS full_parameter_type,
+    pd.is_output,
+    pd.has_default_value,
+    
+    -- Table Statistics
+    ts.row_count,
+    ts.total_space_mb,
+    ts.used_space_mb,
+    ts.data_space_mb,
+    
+    -- Definition (for views, procedures, functions)
+    OBJECT_DEFINITION(od.object_id) AS object_definition
 
-def _polars_is_email(series: pl.Series) -> pl.Series:
-    return series.str.contains(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+FROM ObjectDetails od
+LEFT JOIN ColumnDetails cd ON od.object_id = cd.object_id
+LEFT JOIN ParameterDetails pd ON od.object_id = pd.object_id
+LEFT JOIN TableStats ts ON od.object_id = ts.object_id
 
-def _pandas_min_length(series: pd.Series, n: int) -> pd.Series:
-    return series.astype(str).str.len() >= n
-
-def _polars_min_length(series: pl.Series, n: int) -> pl.Series:
-    return series.str.len_chars() >= n
-
-def _pandas_max_length(series: pd.Series, n: int) -> pd.Series:
-    return series.astype(str).str.len() <= n
-
-def _polars_max_length(series: pl.Series, n: int) -> pl.Series:
-    return series.str.len_chars() <= n
-
-def _pandas_gt(series: pd.Series, n: float) -> pd.Series:
-    return series > n
-
-def _polars_gt(series: pl.Series, n: float) -> pl.Series:
-    return series > n
-
-def _pandas_lt(series: pd.Series, n: float) -> pd.Series:
-    return series < n
-
-def _polars_lt(series: pl.Series, n: float) -> pl.Series:
-    return series < n
-
-def _pandas_between(series: pd.Series, lo: float, hi: float) -> pd.Series:
-    return (series >= lo) & (series <= hi)
-
-def _polars_between(series: pl.Series, lo: float, hi: float) -> pl.Series:
-    return (series >= lo) & (series <= hi)
-
-def _pandas_pattern(series: pd.Series, regex: str) -> pd.Series:
-    return series.astype(str).str.match(regex, na=False)
-
-def _polars_pattern(series: pl.Series, regex: str) -> pl.Series:
-    return series.str.contains(regex)
-
-def _pandas_is_in(series: pd.Series, values) -> pd.Series:
-    return series.isin(values)
-
-def _polars_is_in(series: pl.Series, values) -> pl.Series:
-    return series.is_in(values)
-
-def _pandas_not_in(series: pd.Series, values) -> pd.Series:
-    return ~series.isin(values)
-
-def _polars_not_in(series: pl.Series, values) -> pl.Series:
-    return ~series.is_in(values)
-
-# --- Required / Not Blank ---
-def _pandas_required(series: pd.Series) -> pd.Series:
-    return series.notna()
-
-def _polars_required(series: pl.Series) -> pl.Series:
-    return series.is_not_null()
-
-def _pandas_not_blank(series: pd.Series) -> pd.Series:
-    return series.astype(str).str.strip().ne("")
-
-def _polars_not_blank(series: pl.Series) -> pl.Series:
-    return series.str.strip_chars().str.len_chars() > 0
-
-def _pandas_not_null(series: pd.Series) -> pd.Series:
-    return series.notna()
-
-def _polars_not_null(series: pl.Series) -> pl.Series:
-    return series.is_not_null()
-
-# --- Date Validators ---
-def _try_parse_date(val, fmt=None):
-    try:
-        if fmt:
-            return datetime.strptime(val, fmt)
-        return datetime.fromisoformat(val)
-    except Exception:
-        return None
-
-def _pandas_is_date(series: pd.Series, fmt=None) -> pd.Series:
-    return series.astype(str).apply(lambda x: _try_parse_date(x, fmt) is not None)
-
-def _polars_is_date(series: pl.Series, fmt=None) -> pl.Series:
-    return series.cast(pl.Datetime, strict=False).is_not_null()
-
-def _pandas_before(series: pd.Series, date_str: str, fmt=None) -> pd.Series:
-    cmp = _try_parse_date(date_str, fmt)
-    return series.astype(str).apply(lambda x: (d := _try_parse_date(x, fmt)) and d < cmp)
-
-def _polars_before(series: pl.Series, date_str: str, fmt=None) -> pl.Series:
-    cmp = datetime.fromisoformat(date_str)
-    return series.cast(pl.Datetime, strict=False) < cmp
-
-def _pandas_after(series: pd.Series, date_str: str, fmt=None) -> pd.Series:
-    cmp = _try_parse_date(date_str, fmt)
-    return series.astype(str).apply(lambda x: (d := _try_parse_date(x, fmt)) and d > cmp)
-
-def _polars_after(series: pl.Series, date_str: str, fmt=None) -> pl.Series:
-    cmp = datetime.fromisoformat(date_str)
-    return series.cast(pl.Datetime, strict=False) > cmp
-
-def _pandas_between_dates(series: pd.Series, start: str, end: str, fmt=None) -> pd.Series:
-    lo = _try_parse_date(start, fmt)
-    hi = _try_parse_date(end, fmt)
-    return series.astype(str).apply(lambda x: (d := _try_parse_date(x, fmt)) and lo <= d <= hi)
-
-def _polars_between_dates(series: pl.Series, start: str, end: str, fmt=None) -> pl.Series:
-    lo, hi = datetime.fromisoformat(start), datetime.fromisoformat(end)
-    d = series.cast(pl.Datetime, strict=False)
-    return (d >= lo) & (d <= hi)
-
-# --- Type Validators ---
-def _pandas_is_int(series: pd.Series) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce").notna() & (series.astype(str).str.match(r"^-?\d+$"))
-
-def _polars_is_int(series: pl.Series) -> pl.Series:
-    return series.cast(pl.Int64, strict=False).is_not_null()
-
-def _pandas_is_float(series: pd.Series) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce").notna()
-
-def _polars_is_float(series: pl.Series) -> pl.Series:
-    return series.cast(pl.Float64, strict=False).is_not_null()
-
-def _pandas_is_string(series: pd.Series) -> pd.Series:
-    return series.apply(lambda x: isinstance(x, str))
-
-def _polars_is_string(series: pl.Series) -> pl.Series:
-    return series.dtype == pl.Utf8
-
-def _pandas_is_bool(series: pd.Series) -> pd.Series:
-    return series.apply(lambda x: isinstance(x, bool))
-
-def _polars_is_bool(series: pl.Series) -> pl.Series:
-    return series.dtype == pl.Boolean
-
-def _pandas_is_date_type(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, errors="coerce").notna()
-
-def _polars_is_date_type(series: pl.Series) -> pl.Series:
-    return series.cast(pl.Datetime, strict=False).is_not_null()
-
-# ------------------------
-# Validator Registry
-# ------------------------
-VALIDATORS = {
-    "is_uuid": {"pandas": _pandas_is_uuid, "polars": _polars_is_uuid},
-    "is_email": {"pandas": _pandas_is_email, "polars": _polars_is_email},
-    "min_length": {"pandas": _pandas_min_length, "polars": _polars_min_length},
-    "max_length": {"pandas": _pandas_max_length, "polars": _polars_max_length},
-    "gt": {"pandas": _pandas_gt, "polars": _polars_gt},
-    "lt": {"pandas": _pandas_lt, "polars": _polars_lt},
-    "between": {"pandas": _pandas_between, "polars": _polars_between},
-    "pattern": {"pandas": _pandas_pattern, "polars": _polars_pattern},
-    "is_in": {"pandas": _pandas_is_in, "polars": _polars_is_in},
-    "not_in": {"pandas": _pandas_not_in, "polars": _polars_not_in},
-    "required": {"pandas": _pandas_required, "polars": _polars_required},
-    "not_blank": {"pandas": _pandas_not_blank, "polars": _polars_not_blank},
-    "is_date": {"pandas": _pandas_is_date, "polars": _polars_is_date},
-    "before": {"pandas": _pandas_before, "polars": _polars_before},
-    "after": {"pandas": _pandas_after, "polars": _polars_after},
-    "between_dates": {"pandas": _pandas_between_dates, "polars": _polars_between_dates},
-    "is_int": {"pandas": _pandas_is_int, "polars": _polars_is_int},
-    "is_float": {"pandas": _pandas_is_float, "polars": _polars_is_float},
-    "is_string": {"pandas": _pandas_is_string, "polars": _polars_is_string},
-    "is_bool": {"pandas": _pandas_is_bool, "polars": _polars_is_bool},
-    "is_date_type": {"pandas": _pandas_is_date_type, "polars": _polars_is_date_type},
-    "not_null": {"pandas": _pandas_not_null, "polars": _polars_not_null},
-}
-
-# ------------------------
-# Column DSL
-# ------------------------
-class Column:
-    def __init__(self, name: str, required: bool = True):
-        self.name = name
-        self.required_flag = required
-        self.rules = []
-
-    def _add(self, validator, *args):
-        self.rules.append((validator, args))
-        return self
-
-    # Core
-    def required(self): return self._add("required")
-    def not_blank(self): return self._add("not_blank")
-    def not_null(self): return self._add("not_null")
-
-    # Types
-    def is_int(self): return self._add("is_int")
-    def is_float(self): return self._add("is_float")
-    def is_string(self): return self._add("is_string")
-    def is_bool(self): return self._add("is_bool")
-    def is_date_type(self): return self._add("is_date_type")
-
-    # String
-    def is_uuid(self): return self._add("is_uuid")
-    def is_email(self): return self._add("is_email")
-    def min_length(self, n): return self._add("min_length", n)
-    def max_length(self, n): return self._add("max_length", n)
-    def pattern(self, regex): return self._add("pattern", regex)
-
-    # Numeric
-    def gt(self, n): return self._add("gt", n)
-    def lt(self, n): return self._add("lt", n)
-    def between(self, lo, hi): return self._add("between", lo, hi)
-    def is_in(self, values): return self._add("is_in", values)
-    def not_in(self, values): return self._add("not_in", values)
-
-    # Dates
-    def is_date(self, fmt=None): return self._add("is_date", fmt)
-    def before(self, date_str, fmt=None): return self._add("before", date_str, fmt)
-    def after(self, date_str, fmt=None): return self._add("after", date_str, fmt)
-    def between_dates(self, start, end, fmt=None): return self._add("between_dates", start, end, fmt)
-
-# ------------------------
-# Validator Runner
-# ------------------------
-class DataValidator:
-    def __init__(self, backend="pandas"):
-        if backend not in ("pandas", "polars"):
-            raise ValueError("backend must be 'pandas' or 'polars'")
-        self.backend = backend
-        self.columns = []
-
-    def add_column(self, column: Column):
-        self.columns.append(column)
-        return self
-
-    def validate(self, df):
-        errors = []
-        for col in self.columns:
-            if col.name not in df.columns:
-                if col.required_flag:
-                    errors.append((None, col.name, "Missing required column"))
-                continue
-
-            series = df[col.name]
-            for validator, args in col.rules:
-                func = VALIDATORS[validator][self.backend]
-                mask = func(series, *args) if args else func(series)
-                # Convert Polars Series to NumPy array for index
-                if self.backend == "polars":
-                    mask = mask.to_numpy()
-                invalid_idx = (~mask).nonzero()[0]
-                for i in invalid_idx:
-                    errors.append((i, col.name, f"Failed {validator}"))
-        return errors
-
-    def raise_for_errors(self, df):
-        errs = self.validate(df)
-        if errs:
-            raise ValueError(f"Validation failed: {errs}")
-
+ORDER BY 
+    od.schema_name,
+    od.object_type_friendly,
+    od.object_name,
+    cd.column_id,
+    pd.parameter_id;
