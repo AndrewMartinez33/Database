@@ -1,41 +1,866 @@
-import pandas as pd
+/*==============================================================================
+-- Stored Procedure: sp_GenerateDataDictionary
+-- Description: Comprehensive data dictionary generator for SQL Server
+-- Author: Expert DBA
+-- Created: 2026-01-30
+-- 
+-- Purpose: Extracts complete metadata for all user-created database objects
+--          including tables, views, indexes, stored procedures, functions,
+--          columns, and their relationships with creation/modification dates
+--          and responsible users.
+--
+-- Usage: EXEC sp_GenerateDataDictionary @ObjectType = 'ALL'
+--
+-- Parameters:
+--   @ObjectType: 'ALL', 'TABLES', 'VIEWS', 'INDEXES', 'PROCEDURES', 
+--                'FUNCTIONS', 'COLUMNS', 'CONSTRAINTS', 'DEPENDENCIES',
+--                'TRIGGERS', 'TYPES', 'TABLE_TYPES', 'SYNONYMS', 'SEQUENCES'
+--   @SchemaName: Optional filter for specific schema (default: all schemas)
+--   @ObjectName: Optional filter for specific object (default: all objects)
+==============================================================================*/
 
+USE [master]
+GO
 
-def split_dataframe_into_chunks(df, num_chunks):
-    """Splits a pandas DataFrame into a specified number of chunks.
+IF OBJECT_ID('dbo.sp_GenerateDataDictionary', 'P') IS NOT NULL
+    DROP PROCEDURE dbo.sp_GenerateDataDictionary;
+GO
 
-    Args:
-        df (pandas.DataFrame): The DataFrame to split.
-        num_chunks (int): The desired number of chunks.
+CREATE PROCEDURE dbo.sp_GenerateDataDictionary
+    @ObjectType NVARCHAR(50) = 'ALL',
+    @SchemaName NVARCHAR(128) = NULL,
+    @ObjectName NVARCHAR(128) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    DECLARE @SQL NVARCHAR(MAX);
+    
+    -- =========================================================================
+    -- 1. TABLES METADATA
+    -- =========================================================================
+    IF @ObjectType IN ('ALL', 'TABLES')
+    BEGIN
+        SELECT 
+            'TABLE' AS ObjectType,
+            SCHEMA_NAME(t.schema_id) AS SchemaName,
+            t.name AS ObjectName,
+            NULL AS ColumnName,
+            NULL AS DataType,
+            NULL AS MaxLength,
+            NULL AS [Precision],
+            NULL AS Scale,
+            NULL AS IsNullable,
+            NULL AS DefaultValue,
+            ep.value AS [Description],
+            t.create_date AS CreateDate,
+            t.modify_date AS ModifyDate,
+            SUSER_SNAME(t.principal_id) AS OwnerName,
+            p.rows AS [RowCount],
+            CAST((SUM(a.total_pages) * 8) / 1024.0 AS DECIMAL(18,2)) AS SizeMB,
+            CAST((SUM(a.used_pages) * 8) / 1024.0 AS DECIMAL(18,2)) AS UsedSpaceMB,
+            t.is_replicated AS IsReplicated,
+            t.is_tracked_by_cdc AS IsCDCEnabled,
+            CASE 
+                WHEN t.temporal_type = 2 THEN 'SYSTEM_VERSIONED'
+                WHEN t.temporal_type = 1 THEN 'HISTORY_TABLE'
+                ELSE 'NONE'
+            END AS TemporalType,
+            -- Generate CREATE TABLE script from metadata
+            'CREATE TABLE [' + SCHEMA_NAME(t.schema_id) + '].[' + t.name + '] (' + CHAR(13) + CHAR(10) +
+            STUFF((
+                SELECT ',' + CHAR(13) + CHAR(10) + '    [' + c.name + '] ' + 
+                    TYPE_NAME(c.user_type_id) +
+                    CASE 
+                        WHEN TYPE_NAME(c.user_type_id) IN ('varchar', 'nvarchar', 'char', 'nchar', 'varbinary', 'binary')
+                        THEN '(' + CASE WHEN c.max_length = -1 THEN 'MAX' 
+                                       WHEN TYPE_NAME(c.user_type_id) IN ('nvarchar', 'nchar') 
+                                       THEN CAST(c.max_length/2 AS VARCHAR(10))
+                                       ELSE CAST(c.max_length AS VARCHAR(10)) END + ')'
+                        WHEN TYPE_NAME(c.user_type_id) IN ('decimal', 'numeric')
+                        THEN '(' + CAST(c.precision AS VARCHAR(10)) + ',' + CAST(c.scale AS VARCHAR(10)) + ')'
+                        WHEN TYPE_NAME(c.user_type_id) IN ('time', 'datetime2', 'datetimeoffset')
+                        THEN '(' + CAST(c.scale AS VARCHAR(10)) + ')'
+                        ELSE ''
+                    END +
+                    CASE WHEN c.is_identity = 1 THEN ' IDENTITY(' + CAST(IDENT_SEED(OBJECT_NAME(c.object_id)) AS VARCHAR(10)) + ',' + CAST(IDENT_INCR(OBJECT_NAME(c.object_id)) AS VARCHAR(10)) + ')' ELSE '' END +
+                    CASE WHEN c.is_nullable = 0 THEN ' NOT NULL' ELSE ' NULL' END +
+                    CASE WHEN dc.definition IS NOT NULL THEN ' DEFAULT ' + dc.definition ELSE '' END +
+                    CASE WHEN cc.definition IS NOT NULL THEN ' AS ' + cc.definition ELSE '' END +
+                    CASE WHEN c.collation_name IS NOT NULL AND c.collation_name <> DATABASEPROPERTYEX(DB_NAME(), 'Collation') 
+                         THEN ' COLLATE ' + c.collation_name ELSE '' END
+                FROM sys.columns c
+                LEFT JOIN sys.default_constraints dc ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id
+                LEFT JOIN sys.computed_columns cc ON cc.object_id = c.object_id AND cc.column_id = c.column_id
+                WHERE c.object_id = t.object_id
+                ORDER BY c.column_id
+                FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 1, '') +
+            CHAR(13) + CHAR(10) + ');' AS TableDefinition
+        FROM sys.tables t
+        LEFT JOIN sys.extended_properties ep 
+            ON ep.major_id = t.object_id 
+            AND ep.minor_id = 0 
+            AND ep.name = 'MS_Description'
+        LEFT JOIN sys.partitions p 
+            ON p.object_id = t.object_id 
+            AND p.index_id IN (0, 1)
+        LEFT JOIN sys.allocation_units a 
+            ON a.container_id = p.partition_id
+        WHERE t.is_ms_shipped = 0
+            AND t.type = 'U'
+            AND (@SchemaName IS NULL OR SCHEMA_NAME(t.schema_id) = @SchemaName)
+            AND (@ObjectName IS NULL OR t.name = @ObjectName)
+        GROUP BY 
+            t.schema_id, t.name, t.object_id, ep.value, t.create_date, 
+            t.modify_date, t.principal_id, p.rows, t.is_replicated, 
+            t.is_tracked_by_cdc, t.temporal_type
+        ORDER BY SchemaName, ObjectName;
+    END
 
-    Returns:
-        list: A list containing the split DataFrames.
+    -- =========================================================================
+    -- 2. COLUMNS METADATA
+    -- =========================================================================
+    IF @ObjectType IN ('ALL', 'COLUMNS')
+    BEGIN
+        SELECT 
+            'COLUMN' AS ObjectType,
+            SCHEMA_NAME(o.schema_id) AS SchemaName,
+            o.name AS ObjectName,
+            c.name AS ColumnName,
+            TYPE_NAME(c.user_type_id) AS DataType,
+            CASE 
+                WHEN TYPE_NAME(c.user_type_id) IN ('varchar', 'nvarchar', 'char', 'nchar', 'varbinary', 'binary')
+                THEN CASE WHEN c.max_length = -1 THEN 'MAX' ELSE CAST(c.max_length AS VARCHAR(10)) END
+                ELSE NULL
+            END AS MaxLength,
+            c.precision AS [Precision],
+            c.scale AS Scale,
+            CASE WHEN c.is_nullable = 1 THEN 'YES' ELSE 'NO' END AS IsNullable,
+            dc.definition AS DefaultValue,
+            ep.value AS [Description],
+            o.create_date AS CreateDate,
+            o.modify_date AS ModifyDate,
+            NULL AS OwnerName,
+            c.column_id AS OrdinalPosition,
+            CASE WHEN c.is_identity = 1 THEN 'YES' ELSE 'NO' END AS IsIdentity,
+            CASE WHEN c.is_computed = 1 THEN 'YES' ELSE 'NO' END AS IsComputed,
+            cc.definition AS ComputedDefinition,
+            CASE WHEN ic.object_id IS NOT NULL THEN 'YES' ELSE 'NO' END AS IsInPrimaryKey,
+            CASE WHEN c.is_rowguidcol = 1 THEN 'YES' ELSE 'NO' END AS IsRowGuidCol,
+            c.collation_name AS Collation
+        FROM sys.columns c
+        INNER JOIN sys.objects o 
+            ON c.object_id = o.object_id
+        LEFT JOIN sys.extended_properties ep 
+            ON ep.major_id = c.object_id 
+            AND ep.minor_id = c.column_id 
+            AND ep.name = 'MS_Description'
+        LEFT JOIN sys.default_constraints dc 
+            ON dc.parent_object_id = c.object_id 
+            AND dc.parent_column_id = c.column_id
+        LEFT JOIN sys.computed_columns cc 
+            ON cc.object_id = c.object_id 
+            AND cc.column_id = c.column_id
+        LEFT JOIN sys.index_columns ic 
+            ON ic.object_id = c.object_id 
+            AND ic.column_id = c.column_id
+        LEFT JOIN sys.indexes i 
+            ON i.object_id = ic.object_id 
+            AND i.index_id = ic.index_id 
+            AND i.is_primary_key = 1
+        WHERE o.is_ms_shipped = 0
+            AND o.type IN ('U', 'V')
+            AND (@SchemaName IS NULL OR SCHEMA_NAME(o.schema_id) = @SchemaName)
+            AND (@ObjectName IS NULL OR o.name = @ObjectName)
+        ORDER BY SchemaName, ObjectName, OrdinalPosition;
+    END
 
-    Raises:
-        ValueError: If the number of chunks is not positive.
-    """
+    -- =========================================================================
+    -- 3. INDEXES METADATA
+    -- =========================================================================
+    IF @ObjectType IN ('ALL', 'INDEXES')
+    BEGIN
+        SELECT 
+            'INDEX' AS ObjectType,
+            SCHEMA_NAME(o.schema_id) AS SchemaName,
+            o.name AS ObjectName,
+            i.name AS IndexName,
+            CASE i.type
+                WHEN 0 THEN 'HEAP'
+                WHEN 1 THEN 'CLUSTERED'
+                WHEN 2 THEN 'NONCLUSTERED'
+                WHEN 3 THEN 'XML'
+                WHEN 4 THEN 'SPATIAL'
+                WHEN 5 THEN 'CLUSTERED COLUMNSTORE'
+                WHEN 6 THEN 'NONCLUSTERED COLUMNSTORE'
+                WHEN 7 THEN 'NONCLUSTERED HASH'
+            END AS IndexType,
+            CASE WHEN i.is_primary_key = 1 THEN 'YES' ELSE 'NO' END AS IsPrimaryKey,
+            CASE WHEN i.is_unique = 1 THEN 'YES' ELSE 'NO' END AS IsUnique,
+            CASE WHEN i.is_unique_constraint = 1 THEN 'YES' ELSE 'NO' END AS IsUniqueConstraint,
+            STUFF((
+                SELECT ', ' + c.name + 
+                    CASE WHEN ic.is_descending_key = 1 THEN ' DESC' ELSE ' ASC' END
+                FROM sys.index_columns ic
+                INNER JOIN sys.columns c 
+                    ON ic.object_id = c.object_id 
+                    AND ic.column_id = c.column_id
+                WHERE ic.object_id = i.object_id 
+                    AND ic.index_id = i.index_id
+                    AND ic.is_included_column = 0
+                ORDER BY ic.key_ordinal
+                FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS KeyColumns,
+            STUFF((
+                SELECT ', ' + c.name
+                FROM sys.index_columns ic
+                INNER JOIN sys.columns c 
+                    ON ic.object_id = c.object_id 
+                    AND ic.column_id = c.column_id
+                WHERE ic.object_id = i.object_id 
+                    AND ic.index_id = i.index_id
+                    AND ic.is_included_column = 1
+                ORDER BY c.name
+                FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS IncludedColumns,
+            i.filter_definition AS FilterDefinition,
+            i.fill_factor AS FillFactor,
+            CASE WHEN i.is_padded = 1 THEN 'YES' ELSE 'NO' END AS IsPadded,
+            CASE WHEN i.is_disabled = 1 THEN 'YES' ELSE 'NO' END AS IsDisabled,
+            STATS_DATE(i.object_id, i.index_id) AS LastStatisticsUpdate,
+            ps.row_count AS [RowCount],
+            CAST((ps.reserved_page_count * 8) / 1024.0 AS DECIMAL(18,2)) AS SizeMB,
+            ps.index_type_desc AS StorageType,
+            o.create_date AS CreateDate,
+            o.modify_date AS ModifyDate,
+            -- Generate CREATE INDEX script
+            CASE 
+                WHEN i.is_primary_key = 1 OR i.is_unique_constraint = 1 THEN 
+                    '-- This is a ' + CASE WHEN i.is_primary_key = 1 THEN 'PRIMARY KEY' ELSE 'UNIQUE CONSTRAINT' END + ', see CONSTRAINTS section for definition'
+                WHEN i.type = 5 THEN
+                    'CREATE CLUSTERED COLUMNSTORE INDEX [' + i.name + '] ON [' + SCHEMA_NAME(o.schema_id) + '].[' + o.name + '];'
+                WHEN i.type = 6 THEN
+                    'CREATE NONCLUSTERED COLUMNSTORE INDEX [' + i.name + '] ON [' + SCHEMA_NAME(o.schema_id) + '].[' + o.name + '] (' +
+                    STUFF((
+                        SELECT ', [' + c.name + ']'
+                        FROM sys.index_columns ic
+                        INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+                        WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id
+                        ORDER BY ic.index_column_id
+                        FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '') + ');'
+                ELSE
+                    'CREATE ' + 
+                    CASE WHEN i.is_unique = 1 THEN 'UNIQUE ' ELSE '' END +
+                    CASE i.type WHEN 1 THEN 'CLUSTERED ' ELSE 'NONCLUSTERED ' END +
+                    'INDEX [' + i.name + '] ON [' + SCHEMA_NAME(o.schema_id) + '].[' + o.name + '] (' +
+                    STUFF((
+                        SELECT ', [' + c.name + ']' + 
+                            CASE WHEN ic.is_descending_key = 1 THEN ' DESC' ELSE ' ASC' END
+                        FROM sys.index_columns ic
+                        INNER JOIN sys.columns c 
+                            ON ic.object_id = c.object_id 
+                            AND ic.column_id = c.column_id
+                        WHERE ic.object_id = i.object_id 
+                            AND ic.index_id = i.index_id
+                            AND ic.is_included_column = 0
+                        ORDER BY ic.key_ordinal
+                        FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '') + ')' +
+                    CASE 
+                        WHEN EXISTS (SELECT 1 FROM sys.index_columns ic WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 1)
+                        THEN ' INCLUDE (' + STUFF((
+                            SELECT ', [' + c.name + ']'
+                            FROM sys.index_columns ic
+                            INNER JOIN sys.columns c 
+                                ON ic.object_id = c.object_id 
+                                AND ic.column_id = c.column_id
+                            WHERE ic.object_id = i.object_id 
+                                AND ic.index_id = i.index_id
+                                AND ic.is_included_column = 1
+                            ORDER BY c.name
+                            FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '') + ')'
+                        ELSE ''
+                    END +
+                    CASE WHEN i.filter_definition IS NOT NULL THEN ' WHERE ' + i.filter_definition ELSE '' END +
+                    CASE WHEN i.fill_factor > 0 AND i.fill_factor <> 100 THEN ' WITH (FILLFACTOR = ' + CAST(i.fill_factor AS VARCHAR(3)) + ')' ELSE '' END + ';'
+            END AS IndexDefinition
+        FROM sys.indexes i
+        INNER JOIN sys.objects o 
+            ON i.object_id = o.object_id
+        LEFT JOIN sys.dm_db_partition_stats ps 
+            ON i.object_id = ps.object_id 
+            AND i.index_id = ps.index_id
+        WHERE o.is_ms_shipped = 0
+            AND o.type = 'U'
+            AND i.type > 0  -- Exclude heaps unless specifically needed
+            AND (@SchemaName IS NULL OR SCHEMA_NAME(o.schema_id) = @SchemaName)
+            AND (@ObjectName IS NULL OR o.name = @ObjectName)
+        ORDER BY SchemaName, ObjectName, IndexName;
+    END
 
-    if num_chunks <= 0:
-        raise ValueError("Number of chunks must be positive.")
+    -- =========================================================================
+    -- 4. VIEWS METADATA
+    -- =========================================================================
+    IF @ObjectType IN ('ALL', 'VIEWS')
+    BEGIN
+        SELECT 
+            'VIEW' AS ObjectType,
+            SCHEMA_NAME(v.schema_id) AS SchemaName,
+            v.name AS ObjectName,
+            ep.value AS [Description],
+            v.create_date AS CreateDate,
+            v.modify_date AS ModifyDate,
+            SUSER_SNAME(v.principal_id) AS OwnerName,
+            CASE WHEN v.is_schema_bound = 1 THEN 'YES' ELSE 'NO' END AS IsSchemaBound,
+            CASE WHEN OBJECTPROPERTY(v.object_id, 'IsIndexed') = 1 THEN 'YES' ELSE 'NO' END AS IsIndexed,
+            OBJECT_DEFINITION(v.object_id) AS ViewDefinition,
+            LEN(OBJECT_DEFINITION(v.object_id)) AS DefinitionLength,
+            (SELECT COUNT(*) 
+             FROM sys.sql_dependencies sd 
+             WHERE sd.object_id = v.object_id) AS DependencyCount
+        FROM sys.views v
+        LEFT JOIN sys.extended_properties ep 
+            ON ep.major_id = v.object_id 
+            AND ep.minor_id = 0 
+            AND ep.name = 'MS_Description'
+        WHERE v.is_ms_shipped = 0
+            AND (@SchemaName IS NULL OR SCHEMA_NAME(v.schema_id) = @SchemaName)
+            AND (@ObjectName IS NULL OR v.name = @ObjectName)
+        ORDER BY SchemaName, ObjectName;
+    END
 
-    chunk_size = int(len(df) / num_chunks)
-    chunks = [df[i * chunk_size : (i + 1) * chunk_size] for i in range(num_chunks)]
+    -- =========================================================================
+    -- 5. STORED PROCEDURES METADATA
+    -- =========================================================================
+    IF @ObjectType IN ('ALL', 'PROCEDURES')
+    BEGIN
+        SELECT 
+            'STORED_PROCEDURE' AS ObjectType,
+            SCHEMA_NAME(p.schema_id) AS SchemaName,
+            p.name AS ObjectName,
+            ep.value AS [Description],
+            p.create_date AS CreateDate,
+            p.modify_date AS ModifyDate,
+            SUSER_SNAME(p.principal_id) AS OwnerName,
+            CASE WHEN p.is_auto_executed = 1 THEN 'YES' ELSE 'NO' END AS IsAutoExecuted,
+            CASE WHEN p.is_execution_replicated = 1 THEN 'YES' ELSE 'NO' END AS IsReplicated,
+            CASE WHEN p.is_repl_serializable_only = 1 THEN 'YES' ELSE 'NO' END AS IsReplSerializable,
+            OBJECT_DEFINITION(p.object_id) AS ProcedureDefinition,
+            LEN(OBJECT_DEFINITION(p.object_id)) AS DefinitionLength,
+            qs.execution_count AS ExecutionCount,
+            qs.last_execution_time AS LastExecutionTime,
+            qs.total_elapsed_time / 1000000.0 AS TotalElapsedTimeSec,
+            CASE 
+                WHEN qs.execution_count > 0 
+                THEN (qs.total_elapsed_time / qs.execution_count) / 1000000.0 
+                ELSE NULL 
+            END AS AvgElapsedTimeSec
+        FROM sys.procedures p
+        LEFT JOIN sys.extended_properties ep 
+            ON ep.major_id = p.object_id 
+            AND ep.minor_id = 0 
+            AND ep.name = 'MS_Description'
+        LEFT JOIN sys.dm_exec_procedure_stats qs 
+            ON qs.object_id = p.object_id
+        WHERE p.is_ms_shipped = 0
+            AND (@SchemaName IS NULL OR SCHEMA_NAME(p.schema_id) = @SchemaName)
+            AND (@ObjectName IS NULL OR p.name = @ObjectName)
+        ORDER BY SchemaName, ObjectName;
+    END
 
-    # Handle the case where the data doesn't divide evenly into chunks
-    if len(chunks) < num_chunks:
-        last_chunk = chunks[-1]
-        for i in range(num_chunks - len(chunks)):
-            chunks.append(last_chunk.copy())
+    -- =========================================================================
+    -- 6. FUNCTIONS METADATA
+    -- =========================================================================
+    IF @ObjectType IN ('ALL', 'FUNCTIONS')
+    BEGIN
+        SELECT 
+            'FUNCTION' AS ObjectType,
+            SCHEMA_NAME(o.schema_id) AS SchemaName,
+            o.name AS ObjectName,
+            CASE o.type
+                WHEN 'FN' THEN 'SCALAR_FUNCTION'
+                WHEN 'IF' THEN 'INLINE_TABLE_FUNCTION'
+                WHEN 'TF' THEN 'TABLE_FUNCTION'
+                WHEN 'FS' THEN 'ASSEMBLY_SCALAR_FUNCTION'
+                WHEN 'FT' THEN 'ASSEMBLY_TABLE_FUNCTION'
+                WHEN 'AF' THEN 'AGGREGATE_FUNCTION'
+            END AS FunctionType,
+            ep.value AS [Description],
+            o.create_date AS CreateDate,
+            o.modify_date AS ModifyDate,
+            SUSER_SNAME(o.principal_id) AS OwnerName,
+            CASE WHEN OBJECTPROPERTY(o.object_id, 'IsSchemaBound') = 1 THEN 'YES' ELSE 'NO' END AS IsSchemaBound,
+            CASE WHEN OBJECTPROPERTY(o.object_id, 'IsDeterministic') = 1 THEN 'YES' ELSE 'NO' END AS IsDeterministic,
+            OBJECT_DEFINITION(o.object_id) AS FunctionDefinition,
+            LEN(OBJECT_DEFINITION(o.object_id)) AS DefinitionLength
+        FROM sys.objects o
+        LEFT JOIN sys.extended_properties ep 
+            ON ep.major_id = o.object_id 
+            AND ep.minor_id = 0 
+            AND ep.name = 'MS_Description'
+        WHERE o.is_ms_shipped = 0
+            AND o.type IN ('FN', 'IF', 'TF', 'FS', 'FT', 'AF')
+            AND (@SchemaName IS NULL OR SCHEMA_NAME(o.schema_id) = @SchemaName)
+            AND (@ObjectName IS NULL OR o.name = @ObjectName)
+        ORDER BY SchemaName, ObjectName;
+    END
 
-    return chunks
+    -- =========================================================================
+    -- 7. CONSTRAINTS METADATA
+    -- =========================================================================
+    IF @ObjectType IN ('ALL', 'CONSTRAINTS')
+    BEGIN
+        -- PRIMARY KEY and UNIQUE CONSTRAINTS
+        SELECT 
+            'CONSTRAINT' AS ObjectType,
+            SCHEMA_NAME(o.schema_id) AS SchemaName,
+            OBJECT_NAME(kc.parent_object_id) AS ObjectName,
+            kc.name AS ConstraintName,
+            CASE kc.type
+                WHEN 'PK' THEN 'PRIMARY_KEY'
+                WHEN 'UQ' THEN 'UNIQUE'
+            END AS ConstraintType,
+            STUFF((
+                SELECT ', ' + c.name
+                FROM sys.index_columns ic
+                INNER JOIN sys.columns c 
+                    ON ic.object_id = c.object_id 
+                    AND ic.column_id = c.column_id
+                WHERE ic.object_id = kc.parent_object_id 
+                    AND ic.index_id = kc.unique_index_id
+                ORDER BY ic.key_ordinal
+                FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS ConstraintColumns,
+            NULL AS ReferencedSchema,
+            NULL AS ReferencedTable,
+            NULL AS ReferencedColumns,
+            NULL AS DeleteAction,
+            NULL AS UpdateAction,
+            kc.create_date AS CreateDate,
+            kc.modify_date AS ModifyDate,
+            CASE WHEN kc.is_disabled = 1 THEN 'YES' ELSE 'NO' END AS IsDisabled,
+            'ALTER TABLE [' + SCHEMA_NAME(o.schema_id) + '].[' + OBJECT_NAME(kc.parent_object_id) + '] ADD CONSTRAINT [' + kc.name + '] ' +
+            CASE kc.type WHEN 'PK' THEN 'PRIMARY KEY' WHEN 'UQ' THEN 'UNIQUE' END + ' (' +
+            STUFF((
+                SELECT ', [' + c.name + ']'
+                FROM sys.index_columns ic
+                INNER JOIN sys.columns c 
+                    ON ic.object_id = c.object_id 
+                    AND ic.column_id = c.column_id
+                WHERE ic.object_id = kc.parent_object_id 
+                    AND ic.index_id = kc.unique_index_id
+                ORDER BY ic.key_ordinal
+                FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '') +
+            ');' AS ConstraintDefinition
+        FROM sys.key_constraints kc
+        INNER JOIN sys.objects o 
+            ON kc.parent_object_id = o.object_id
+        WHERE o.is_ms_shipped = 0
+            AND (@SchemaName IS NULL OR SCHEMA_NAME(o.schema_id) = @SchemaName)
+            AND (@ObjectName IS NULL OR OBJECT_NAME(kc.parent_object_id) = @ObjectName)
 
-# Example usage
-data = {'col1': [1, 2, 3, 4, 5, 6, 7, 8, 9], 'col2': ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i']}
-df = pd.DataFrame(data)
-num_chunks = 3
-split_chunks = split_dataframe_into_chunks(df.copy(), num_chunks)
+        UNION ALL
 
-# Print the first few rows of each chunk
-for i, chunk in enumerate(split_chunks):
-    print(f"Chunk {i+1}:")
-    print(chunk.head())
+        -- FOREIGN KEY CONSTRAINTS
+        SELECT 
+            'CONSTRAINT' AS ObjectType,
+            SCHEMA_NAME(o.schema_id) AS SchemaName,
+            OBJECT_NAME(fk.parent_object_id) AS ObjectName,
+            fk.name AS ConstraintName,
+            'FOREIGN_KEY' AS ConstraintType,
+            STUFF((
+                SELECT ', ' + c.name
+                FROM sys.foreign_key_columns fkc
+                INNER JOIN sys.columns c 
+                    ON fkc.parent_object_id = c.object_id 
+                    AND fkc.parent_column_id = c.column_id
+                WHERE fkc.constraint_object_id = fk.object_id
+                ORDER BY fkc.constraint_column_id
+                FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS ConstraintColumns,
+            SCHEMA_NAME(ro.schema_id) AS ReferencedSchema,
+            OBJECT_NAME(fk.referenced_object_id) AS ReferencedTable,
+            STUFF((
+                SELECT ', ' + c.name
+                FROM sys.foreign_key_columns fkc
+                INNER JOIN sys.columns c 
+                    ON fkc.referenced_object_id = c.object_id 
+                    AND fkc.referenced_column_id = c.column_id
+                WHERE fkc.constraint_object_id = fk.object_id
+                ORDER BY fkc.constraint_column_id
+                FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS ReferencedColumns,
+            CASE fk.delete_referential_action
+                WHEN 0 THEN 'NO_ACTION'
+                WHEN 1 THEN 'CASCADE'
+                WHEN 2 THEN 'SET_NULL'
+                WHEN 3 THEN 'SET_DEFAULT'
+            END AS DeleteAction,
+            CASE fk.update_referential_action
+                WHEN 0 THEN 'NO_ACTION'
+                WHEN 1 THEN 'CASCADE'
+                WHEN 2 THEN 'SET_NULL'
+                WHEN 3 THEN 'SET_DEFAULT'
+            END AS UpdateAction,
+            fk.create_date AS CreateDate,
+            fk.modify_date AS ModifyDate,
+            CASE WHEN fk.is_disabled = 1 THEN 'YES' ELSE 'NO' END AS IsDisabled,
+            'ALTER TABLE [' + SCHEMA_NAME(o.schema_id) + '].[' + OBJECT_NAME(fk.parent_object_id) + '] ADD CONSTRAINT [' + fk.name + '] FOREIGN KEY (' +
+            STUFF((
+                SELECT ', [' + c.name + ']'
+                FROM sys.foreign_key_columns fkc
+                INNER JOIN sys.columns c 
+                    ON fkc.parent_object_id = c.object_id 
+                    AND fkc.parent_column_id = c.column_id
+                WHERE fkc.constraint_object_id = fk.object_id
+                ORDER BY fkc.constraint_column_id
+                FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '') +
+            ') REFERENCES [' + SCHEMA_NAME(ro.schema_id) + '].[' + OBJECT_NAME(fk.referenced_object_id) + '] (' +
+            STUFF((
+                SELECT ', [' + c.name + ']'
+                FROM sys.foreign_key_columns fkc
+                INNER JOIN sys.columns c 
+                    ON fkc.referenced_object_id = c.object_id 
+                    AND fkc.referenced_column_id = c.column_id
+                WHERE fkc.constraint_object_id = fk.object_id
+                ORDER BY fkc.constraint_column_id
+                FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '') +
+            ')' +
+            CASE fk.delete_referential_action
+                WHEN 1 THEN ' ON DELETE CASCADE'
+                WHEN 2 THEN ' ON DELETE SET NULL'
+                WHEN 3 THEN ' ON DELETE SET DEFAULT'
+                ELSE ''
+            END +
+            CASE fk.update_referential_action
+                WHEN 1 THEN ' ON UPDATE CASCADE'
+                WHEN 2 THEN ' ON UPDATE SET NULL'
+                WHEN 3 THEN ' ON UPDATE SET DEFAULT'
+                ELSE ''
+            END + ';' AS ConstraintDefinition
+        FROM sys.foreign_keys fk
+        INNER JOIN sys.objects o 
+            ON fk.parent_object_id = o.object_id
+        INNER JOIN sys.objects ro 
+            ON fk.referenced_object_id = ro.object_id
+        WHERE o.is_ms_shipped = 0
+            AND (@SchemaName IS NULL OR SCHEMA_NAME(o.schema_id) = @SchemaName)
+            AND (@ObjectName IS NULL OR OBJECT_NAME(fk.parent_object_id) = @ObjectName)
+
+        UNION ALL
+
+        -- CHECK CONSTRAINTS
+        SELECT 
+            'CONSTRAINT' AS ObjectType,
+            SCHEMA_NAME(o.schema_id) AS SchemaName,
+            OBJECT_NAME(cc.parent_object_id) AS ObjectName,
+            cc.name AS ConstraintName,
+            'CHECK' AS ConstraintType,
+            NULL AS ConstraintColumns,
+            NULL AS ReferencedSchema,
+            NULL AS ReferencedTable,
+            NULL AS ReferencedColumns,
+            NULL AS DeleteAction,
+            NULL AS UpdateAction,
+            cc.create_date AS CreateDate,
+            cc.modify_date AS ModifyDate,
+            CASE WHEN cc.is_disabled = 1 THEN 'YES' ELSE 'NO' END AS IsDisabled,
+            cc.definition AS ConstraintDefinition
+        FROM sys.check_constraints cc
+        INNER JOIN sys.objects o 
+            ON cc.parent_object_id = o.object_id
+        WHERE o.is_ms_shipped = 0
+            AND (@SchemaName IS NULL OR SCHEMA_NAME(o.schema_id) = @SchemaName)
+            AND (@ObjectName IS NULL OR OBJECT_NAME(cc.parent_object_id) = @ObjectName)
+
+        ORDER BY SchemaName, ObjectName, ConstraintName;
+    END
+
+    -- =========================================================================
+    -- 8. OBJECT DEPENDENCIES
+    -- =========================================================================
+    IF @ObjectType IN ('ALL', 'DEPENDENCIES')
+    BEGIN
+        SELECT 
+            'DEPENDENCY' AS RelationType,
+            SCHEMA_NAME(o.schema_id) AS ReferencingSchema,
+            o.name AS ReferencingObject,
+            o.type_desc AS ReferencingType,
+            SCHEMA_NAME(ro.schema_id) AS ReferencedSchema,
+            ro.name AS ReferencedObject,
+            ro.type_desc AS ReferencedType,
+            CASE WHEN sed.is_schema_bound_reference = 1 THEN 'YES' ELSE 'NO' END AS IsSchemaBound,
+            sed.referenced_minor_name AS ReferencedColumn
+        FROM sys.sql_expression_dependencies sed
+        INNER JOIN sys.objects o 
+            ON sed.referencing_id = o.object_id
+        INNER JOIN sys.objects ro 
+            ON sed.referenced_id = ro.object_id
+        WHERE o.is_ms_shipped = 0
+            AND ro.is_ms_shipped = 0
+            AND (@SchemaName IS NULL OR SCHEMA_NAME(o.schema_id) = @SchemaName)
+            AND (@ObjectName IS NULL OR o.name = @ObjectName)
+        ORDER BY ReferencingSchema, ReferencingObject, ReferencedObject;
+    END
+
+    -- =========================================================================
+    -- 9. TRIGGERS METADATA
+    -- =========================================================================
+    IF @ObjectType IN ('ALL', 'TRIGGERS')
+    BEGIN
+        SELECT 
+            'TRIGGER' AS ObjectType,
+            SCHEMA_NAME(o.schema_id) AS SchemaName,
+            OBJECT_NAME(tr.parent_id) AS ObjectName,
+            tr.name AS TriggerName,
+            CASE tr.parent_class
+                WHEN 0 THEN 'DATABASE'
+                WHEN 1 THEN 'TABLE/VIEW'
+            END AS TriggerScope,
+            ep.value AS [Description],
+            tr.create_date AS CreateDate,
+            tr.modify_date AS ModifyDate,
+            CASE WHEN tr.is_disabled = 1 THEN 'YES' ELSE 'NO' END AS IsDisabled,
+            CASE WHEN tr.is_instead_of_trigger = 1 THEN 'INSTEAD_OF' ELSE 'AFTER' END AS TriggerType,
+            CASE WHEN OBJECTPROPERTY(tr.object_id, 'ExecIsUpdateTrigger') = 1 THEN 'UPDATE, ' ELSE '' END +
+            CASE WHEN OBJECTPROPERTY(tr.object_id, 'ExecIsDeleteTrigger') = 1 THEN 'DELETE, ' ELSE '' END +
+            CASE WHEN OBJECTPROPERTY(tr.object_id, 'ExecIsInsertTrigger') = 1 THEN 'INSERT, ' ELSE '' END AS TriggerEvents,
+            OBJECT_DEFINITION(tr.object_id) AS TriggerDefinition
+        FROM sys.triggers tr
+        LEFT JOIN sys.objects o 
+            ON tr.parent_id = o.object_id
+        LEFT JOIN sys.extended_properties ep 
+            ON ep.major_id = tr.object_id 
+            AND ep.minor_id = 0 
+            AND ep.name = 'MS_Description'
+        WHERE tr.is_ms_shipped = 0
+            AND (@SchemaName IS NULL OR SCHEMA_NAME(o.schema_id) = @SchemaName)
+            AND (@ObjectName IS NULL OR OBJECT_NAME(tr.parent_id) = @ObjectName)
+        ORDER BY SchemaName, ObjectName, TriggerName;
+    END
+
+    -- =========================================================================
+    -- 10. USER-DEFINED DATA TYPES
+    -- =========================================================================
+    IF @ObjectType IN ('ALL', 'TYPES')
+    BEGIN
+        SELECT 
+            'USER_DEFINED_TYPE' AS ObjectType,
+            SCHEMA_NAME(t.schema_id) AS SchemaName,
+            t.name AS TypeName,
+            TYPE_NAME(t.system_type_id) AS BaseType,
+            t.max_length AS MaxLength,
+            t.precision AS [Precision],
+            t.scale AS Scale,
+            t.collation_name AS Collation,
+            CASE WHEN t.is_nullable = 1 THEN 'YES' ELSE 'NO' END AS IsNullable,
+            CASE WHEN t.is_user_defined = 1 THEN 'YES' ELSE 'NO' END AS IsUserDefined,
+            CASE WHEN t.is_assembly_type = 1 THEN 'YES' ELSE 'NO' END AS IsAssemblyType,
+            dc.definition AS DefaultBinding,
+            rc.definition AS RuleBinding,
+            ep.value AS [Description],
+            -- Generate CREATE TYPE script
+            'CREATE TYPE [' + SCHEMA_NAME(t.schema_id) + '].[' + t.name + '] FROM ' +
+            TYPE_NAME(t.system_type_id) +
+            CASE 
+                WHEN TYPE_NAME(t.system_type_id) IN ('varchar', 'nvarchar', 'char', 'nchar', 'varbinary', 'binary')
+                THEN '(' + CASE WHEN t.max_length = -1 THEN 'MAX' 
+                               WHEN TYPE_NAME(t.system_type_id) IN ('nvarchar', 'nchar') 
+                               THEN CAST(t.max_length/2 AS VARCHAR(10))
+                               ELSE CAST(t.max_length AS VARCHAR(10)) END + ')'
+                WHEN TYPE_NAME(t.system_type_id) IN ('decimal', 'numeric')
+                THEN '(' + CAST(t.precision AS VARCHAR(10)) + ',' + CAST(t.scale AS VARCHAR(10)) + ')'
+                ELSE ''
+            END +
+            CASE WHEN t.is_nullable = 0 THEN ' NOT NULL' ELSE ' NULL' END +
+            ';' AS TypeDefinition
+        FROM sys.types t
+        LEFT JOIN sys.extended_properties ep 
+            ON ep.major_id = t.user_type_id 
+            AND ep.minor_id = 0 
+            AND ep.name = 'MS_Description'
+        LEFT JOIN sys.default_constraints dc 
+            ON dc.object_id = t.default_object_id
+        LEFT JOIN sys.check_constraints rc 
+            ON rc.object_id = t.rule_object_id
+        WHERE t.is_user_defined = 1
+            AND (@SchemaName IS NULL OR SCHEMA_NAME(t.schema_id) = @SchemaName)
+        ORDER BY SchemaName, TypeName;
+    END
+
+    -- =========================================================================
+    -- 11. TABLE-VALUED TYPES (User-Defined Table Types)
+    -- =========================================================================
+    IF @ObjectType IN ('ALL', 'TABLE_TYPES')
+    BEGIN
+        SELECT 
+            'TABLE_TYPE' AS ObjectType,
+            SCHEMA_NAME(tt.schema_id) AS SchemaName,
+            tt.name AS TypeName,
+            c.name AS ColumnName,
+            TYPE_NAME(c.user_type_id) AS DataType,
+            c.max_length AS MaxLength,
+            c.precision AS [Precision],
+            c.scale AS Scale,
+            CASE WHEN c.is_nullable = 1 THEN 'YES' ELSE 'NO' END AS IsNullable,
+            c.column_id AS OrdinalPosition,
+            ep.value AS [Description],
+            -- Generate complete CREATE TYPE script for the table type
+            CASE WHEN c.column_id = 1 THEN
+                'CREATE TYPE [' + SCHEMA_NAME(tt.schema_id) + '].[' + tt.name + '] AS TABLE (' + CHAR(13) + CHAR(10) +
+                STUFF((
+                    SELECT ',' + CHAR(13) + CHAR(10) + '    [' + c2.name + '] ' + 
+                        TYPE_NAME(c2.user_type_id) +
+                        CASE 
+                            WHEN TYPE_NAME(c2.user_type_id) IN ('varchar', 'nvarchar', 'char', 'nchar', 'varbinary', 'binary')
+                            THEN '(' + CASE WHEN c2.max_length = -1 THEN 'MAX' 
+                                           WHEN TYPE_NAME(c2.user_type_id) IN ('nvarchar', 'nchar') 
+                                           THEN CAST(c2.max_length/2 AS VARCHAR(10))
+                                           ELSE CAST(c2.max_length AS VARCHAR(10)) END + ')'
+                            WHEN TYPE_NAME(c2.user_type_id) IN ('decimal', 'numeric')
+                            THEN '(' + CAST(c2.precision AS VARCHAR(10)) + ',' + CAST(c2.scale AS VARCHAR(10)) + ')'
+                            ELSE ''
+                        END +
+                        CASE WHEN c2.is_nullable = 0 THEN ' NOT NULL' ELSE ' NULL' END
+                    FROM sys.columns c2
+                    WHERE c2.object_id = tt.type_table_object_id
+                    ORDER BY c2.column_id
+                    FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 1, '') +
+                CHAR(13) + CHAR(10) + ');'
+            ELSE NULL
+            END AS TypeDefinition
+        FROM sys.table_types tt
+        INNER JOIN sys.columns c 
+            ON c.object_id = tt.type_table_object_id
+        LEFT JOIN sys.extended_properties ep 
+            ON ep.major_id = c.object_id 
+            AND ep.minor_id = c.column_id 
+            AND ep.name = 'MS_Description'
+        WHERE tt.is_user_defined = 1
+            AND (@SchemaName IS NULL OR SCHEMA_NAME(tt.schema_id) = @SchemaName)
+        ORDER BY SchemaName, TypeName, OrdinalPosition;
+    END
+
+    -- =========================================================================
+    -- 12. SYNONYMS
+    -- =========================================================================
+    IF @ObjectType IN ('ALL', 'SYNONYMS')
+    BEGIN
+        SELECT 
+            'SYNONYM' AS ObjectType,
+            SCHEMA_NAME(s.schema_id) AS SchemaName,
+            s.name AS SynonymName,
+            s.base_object_name AS BaseObjectName,
+            ep.value AS [Description],
+            s.create_date AS CreateDate,
+            s.modify_date AS ModifyDate,
+            SUSER_SNAME(s.principal_id) AS OwnerName,
+            -- Generate CREATE SYNONYM script
+            'CREATE SYNONYM [' + SCHEMA_NAME(s.schema_id) + '].[' + s.name + '] FOR ' + s.base_object_name + ';' AS SynonymDefinition
+        FROM sys.synonyms s
+        LEFT JOIN sys.extended_properties ep 
+            ON ep.major_id = s.object_id 
+            AND ep.minor_id = 0 
+            AND ep.name = 'MS_Description'
+        WHERE (@SchemaName IS NULL OR SCHEMA_NAME(s.schema_id) = @SchemaName)
+            AND (@ObjectName IS NULL OR s.name = @ObjectName)
+        ORDER BY SchemaName, SynonymName;
+    END
+
+    -- =========================================================================
+    -- 13. SEQUENCES
+    -- =========================================================================
+    IF @ObjectType IN ('ALL', 'SEQUENCES')
+    BEGIN
+        SELECT 
+            'SEQUENCE' AS ObjectType,
+            SCHEMA_NAME(seq.schema_id) AS SchemaName,
+            seq.name AS SequenceName,
+            TYPE_NAME(seq.user_type_id) AS DataType,
+            CAST(seq.start_value AS VARCHAR(50)) AS StartValue,
+            CAST(seq.increment AS VARCHAR(50)) AS IncrementValue,
+            CAST(seq.minimum_value AS VARCHAR(50)) AS MinimumValue,
+            CAST(seq.maximum_value AS VARCHAR(50)) AS MaximumValue,
+            CASE WHEN seq.is_cycling = 1 THEN 'YES' ELSE 'NO' END AS IsCycling,
+            CASE WHEN seq.is_cached = 1 THEN 'YES' ELSE 'NO' END AS IsCached,
+            seq.cache_size AS CacheSize,
+            CAST(seq.current_value AS VARCHAR(50)) AS CurrentValue,
+            ep.value AS [Description],
+            seq.create_date AS CreateDate,
+            seq.modify_date AS ModifyDate,
+            -- Generate CREATE SEQUENCE script
+            'CREATE SEQUENCE [' + SCHEMA_NAME(seq.schema_id) + '].[' + seq.name + ']' + CHAR(13) + CHAR(10) +
+            '    AS ' + TYPE_NAME(seq.user_type_id) + CHAR(13) + CHAR(10) +
+            '    START WITH ' + CAST(seq.start_value AS VARCHAR(50)) + CHAR(13) + CHAR(10) +
+            '    INCREMENT BY ' + CAST(seq.increment AS VARCHAR(50)) + CHAR(13) + CHAR(10) +
+            '    MINVALUE ' + CAST(seq.minimum_value AS VARCHAR(50)) + CHAR(13) + CHAR(10) +
+            '    MAXVALUE ' + CAST(seq.maximum_value AS VARCHAR(50)) + CHAR(13) + CHAR(10) +
+            CASE WHEN seq.is_cycling = 1 THEN '    CYCLE' + CHAR(13) + CHAR(10) ELSE '    NO CYCLE' + CHAR(13) + CHAR(10) END +
+            CASE WHEN seq.is_cached = 1 THEN '    CACHE ' + CAST(seq.cache_size AS VARCHAR(10)) ELSE '    NO CACHE' END + ';' AS SequenceDefinition
+        FROM sys.sequences seq
+        LEFT JOIN sys.extended_properties ep 
+            ON ep.major_id = seq.object_id 
+            AND ep.minor_id = 0 
+            AND ep.name = 'MS_Description'
+        WHERE (@SchemaName IS NULL OR SCHEMA_NAME(seq.schema_id) = @SchemaName)
+            AND (@ObjectName IS NULL OR seq.name = @ObjectName)
+        ORDER BY SchemaName, SequenceName;
+    END
+
+    -- Summary message
+    PRINT '==================================================================';
+    PRINT 'Data Dictionary Generation Complete';
+    PRINT 'Object Type: ' + @ObjectType;
+    PRINT 'Schema Filter: ' + ISNULL(@SchemaName, 'ALL');
+    PRINT 'Object Filter: ' + ISNULL(@ObjectName, 'ALL');
+    PRINT 'Generated: ' + CONVERT(VARCHAR(30), GETDATE(), 120);
+    PRINT '==================================================================';
+
+END
+GO
+
+-- Grant execute permissions (adjust as needed)
+-- GRANT EXECUTE ON dbo.sp_GenerateDataDictionary TO [YourRole];
+
+/*==============================================================================
+-- USAGE EXAMPLES
+==============================================================================*/
+
+-- Example 1: Get all metadata
+-- EXEC sp_GenerateDataDictionary @ObjectType = 'ALL';
+
+-- Example 2: Get only table metadata
+-- EXEC sp_GenerateDataDictionary @ObjectType = 'TABLES';
+
+-- Example 3: Get columns for a specific schema
+-- EXEC sp_GenerateDataDictionary @ObjectType = 'COLUMNS', @SchemaName = 'dbo';
+
+-- Example 4: Get all metadata for a specific object
+-- EXEC sp_GenerateDataDictionary @ObjectType = 'ALL', @ObjectName = 'YourTableName';
+
+-- Example 5: Get indexes for a specific table
+-- EXEC sp_GenerateDataDictionary @ObjectType = 'INDEXES', @ObjectName = 'YourTableName';
+
+-- Example 6: Get all stored procedures
+-- EXEC sp_GenerateDataDictionary @ObjectType = 'PROCEDURES';
+
+-- Example 7: Get constraints for a specific schema
+-- EXEC sp_GenerateDataDictionary @ObjectType = 'CONSTRAINTS', @SchemaName = 'dbo';
+
+-- Example 8: Get all user-defined data types
+-- EXEC sp_GenerateDataDictionary @ObjectType = 'TYPES';
+
+-- Example 9: Get all table-valued types (user-defined table types)
+-- EXEC sp_GenerateDataDictionary @ObjectType = 'TABLE_TYPES';
+
+-- Example 10: Get all triggers in the database
+-- EXEC sp_GenerateDataDictionary @ObjectType = 'TRIGGERS';
+
+-- Example 11: Get all dependencies between objects
+-- EXEC sp_GenerateDataDictionary @ObjectType = 'DEPENDENCIES';
+
+-- Example 12: Get all synonyms
+-- EXEC sp_GenerateDataDictionary @ObjectType = 'SYNONYMS';
+
+-- Example 13: Get all sequences
+-- EXEC sp_GenerateDataDictionary @ObjectType = 'SEQUENCES';
+
+/*==============================================================================
+-- EXPORT TO EXCEL/CSV TIP:
+-- In SSMS, run the query and use "Results to Grid" mode, then right-click
+-- the results and select "Save Results As..." to export to CSV
+==============================================================================*/
